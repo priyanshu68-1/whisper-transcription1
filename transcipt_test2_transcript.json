@@ -1,0 +1,12 @@
+{
+    "audio_file": "transcipt_test2.mp3",
+    "language": "en",
+    "full_text": "Today's meeting date is 27th August and day is Thursday and the time is 6.45 pm.",
+    "segments": [
+        {
+            "start": 0.0,
+            "end": 8.0,
+            "text": "Today's meeting date is 27th August and day is Thursday and the time is 6.45 pm."
+        }
+    ]
+}

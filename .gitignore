@@ -1,0 +1,13 @@
+# Audio & Output Files
+*.mp3
+*.wav
+*.m4a
+*.mp4
+*.txt
+*.json
+
+# Python & System Cache
+__pycache__/
+*.pyc
+.DS_Store
+.vscode/
