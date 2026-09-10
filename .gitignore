@@ -4,7 +4,14 @@
 *.m4a
 *.mp4
 *.txt
+!requirements.txt
 *.json
+*.md
+!README.md
+
+# Database & Environment
+*.db
+.env
 
 # Python & System Cache
 __pycache__/

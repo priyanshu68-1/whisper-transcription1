@@ -1,0 +1,7 @@
+streamlit>=1.30.0
+openai-whisper
+torch
+python-dotenv
+pydantic>=2.0.0
+pandas
+jiwer
