@@ -81,7 +81,11 @@ class ActionItemEngine:
             data = json.loads(resp.read().decode("utf-8"))
             raw_text = data["candidates"][0]["content"]["parts"][0]["text"]
             parsed = json.loads(raw_text)
-            return parsed.get("action_items", [])
+            items = parsed.get("action_items", [])
+            for it in items:
+                if isinstance(it.get("priority"), str):
+                    it["priority"] = it["priority"].capitalize()
+            return items
 
     def _fallback_extraction(self, transcript: str) -> List[Dict[str, Any]]:
         """
@@ -104,6 +108,9 @@ class ActionItemEngine:
                 speaker = match_speaker.group(1).strip()
                 content = line_clean[match_speaker.end():].strip()
             else:
+                m_lead = re.match(r'^([A-Z][a-zA-Z]+)\s+(?:must|will|needs to|should|is assigned to|is responsible for)\b', line_clean)
+                if m_lead:
+                    speaker = m_lead.group(1).strip()
                 content = line_clean
 
             # Check if sentence contains action commitment
@@ -117,7 +124,9 @@ class ActionItemEngine:
                             deadline = m_deadline.group(1).title()
                             break
 
-                priority = "High" if ("high priority" in lower_content or "urgent" in lower_content or "asap" in lower_content) else "Medium"
+                is_high = any(hp in lower_content for hp in ["high priority", "priority is high", "priority: high", "priority - high", "priority high", "urgent", "asap"])
+                is_low = any(lp in lower_content for lp in ["low priority", "priority is low", "priority: low", "priority - low", "priority low"])
+                priority = "High" if is_high else ("Low" if is_low else "Medium")
                 
                 action_items.append({
                     "task": content,

@@ -114,6 +114,11 @@ class ParticipantMapper:
                         "deadline": "Not specified",
                         "priority": "Medium"
                     })
+            else:
+                narrative_matches = re.findall(r'\b([A-Z][a-zA-Z]+)\s+(?:presented|agreed|proposed|spoke|shared|stated|discussed|suggested|reviewed|joined|said|confirmed|mentioned|will|must|is)\b', line)
+                for nm in narrative_matches:
+                    if nm.lower() not in ["the", "this", "that", "there", "here", "today", "yesterday", "tomorrow", "our", "all"]:
+                        speakers.add(nm)
 
         unique_list = sorted(list(speakers)) if speakers else ["Narrator / Speaker"]
         

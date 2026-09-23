@@ -2,7 +2,7 @@ import os
 import uuid
 import tempfile
 import json
-from datetime import datetime
+from datetime import datetime, timedelta
 import streamlit as st
 import whisper
 import jiwer
@@ -17,6 +17,7 @@ from participant_mapper import ParticipantMapper
 from action_engine import ActionItemEngine
 from database import DatabaseManager
 from pipeline_service import ProcessingPipeline
+from ai_search_service import AISearchEngine
 
 # -----------------------------------------------------------------------------
 # 1. PAGE CONFIGURATION
@@ -524,6 +525,12 @@ def get_db():
     return DatabaseManager()
 
 db = get_db()
+
+@st.cache_resource
+def get_ai_search():
+    return AISearchEngine(db=db)
+
+ai_search = get_ai_search()
 all_meetings = db.list_all_meetings()
 
 # Manage active meeting state cleanly
@@ -569,13 +576,13 @@ with st.sidebar:
     st.markdown("<p style='font-size: 0.8rem; font-weight: 700; text-transform: uppercase; letter-spacing: 0.05em; color: #C7D2FE !important;'>📌 Main Menu</p>", unsafe_allow_html=True)
     app_section = st.radio(
         "Navigation",
-        ["🎙️ Meeting Notes", "🎯 Accuracy Checker"],
+        ["🎙️ Meeting Notes", "📊 Historical Insights", "🎯 Accuracy Checker"],
         index=0,
         label_visibility="collapsed"
     )
     st.divider()
 
-    if app_section == "🎙️ Meeting Notes":
+    if app_section in ["🎙️ Meeting Notes", "📊 Historical Insights"]:
         # Active Meeting Switcher
         st.markdown("<p style='font-size: 0.8rem; font-weight: 700; text-transform: uppercase; letter-spacing: 0.05em; color: #C7D2FE !important;'>📂 Select a Saved Meeting</p>", unsafe_allow_html=True)
         if all_meetings:
@@ -683,7 +690,324 @@ with st.sidebar:
     )
 
 # -----------------------------------------------------------------------------
-# 5. SECTION ROUTING: MEETING NOTES vs ACCURACY CHECKER
+# 5. HISTORICAL MEETING INSIGHTS RENDERER (Milestone 3 - Task 4)
+# -----------------------------------------------------------------------------
+def render_historical_insights(is_tab: bool = False):
+    """
+    Renders the Milestone 3 - Task 4 Historical Meeting Insights Studio:
+    - Overview KPI Tiles (Total Meetings, Action Items, Pending, Completed, Decisions, Participants)
+    - Dynamic Multi-Field Filter Bar (Participant, Date Horizon, Status, Title Keyword)
+    - 6 Detailed Sub-Views:
+      1. 📋 Tasks & To-Dos (with inline status toggles)
+      2. ⚖️ Strategic Decisions Ledger (citing [Meeting ID: ...])
+      3. 👥 People & Workload Directory
+      4. ⏰ Deadlines & Milestones Agenda
+      5. 📈 Project History & Evolution
+      6. 🤖 AI Cross-Meeting Insights Generator
+    """
+    if not is_tab:
+        st.markdown(
+            """
+            <div class="colorful-header" style="background: linear-gradient(135deg, #1E1B4B 0%, #312E81 40%, #4338CA 70%, #7C3AED 100%);">
+                <h1 style="margin: 0; font-size: 2rem; font-weight: 800; letter-spacing: -0.02em;">
+                    📊 Historical Meeting Intelligence & Insights
+                </h1>
+                <p style="margin: 6px 0 0 0; font-size: 0.95rem; opacity: 0.95;">
+                    Cross-meeting analytics, decision ledgers, pending action items, participant workloads, and AI-generated multi-meeting insights.
+                </p>
+            </div>
+            """,
+            unsafe_allow_html=True
+        )
+    else:
+        st.markdown(
+            """
+            <div style="background: linear-gradient(135deg, #1E1B4B 0%, #312E81 50%, #4338CA 100%); border-radius: 14px; padding: 20px 24px; margin-bottom: 20px; color: #FFFFFF !important;">
+                <h3 style="margin: 0; font-size: 1.35rem; font-weight: 800; color: #FFFFFF !important;">📊 Historical Meeting Intelligence & Insights</h3>
+                <p style="margin: 4px 0 0 0; font-size: 0.88rem; color: #C7D2FE !important;">
+                    Analyze trends, decisions, deadlines, and participant workloads across your entire historical meeting knowledge repository.
+                </p>
+            </div>
+            """,
+            unsafe_allow_html=True
+        )
+
+    # 1. Fetch initial list for participant dropdown options
+    all_raw_meetings = db.list_all_meetings()
+    all_parts = set()
+    for m in all_raw_meetings:
+        for p in m.get("participants", []):
+            if p and p.strip():
+                all_parts.add(p.strip())
+    sorted_parts = sorted(list(all_parts))
+
+    # 2. Interactive Filter Bar
+    prefix = "tab_ins_" if is_tab else "page_ins_"
+    with st.container(border=True):
+        st.markdown("<h4 style='margin:0 0 10px 0; color:#1E1B4B;'>🔍 Filter Historical Intelligence</h4>", unsafe_allow_html=True)
+        col_f1, col_f2, col_f3, col_f4 = st.columns([1.5, 1.2, 1.5, 1.2])
+
+        with col_f1:
+            part_filter = st.selectbox(
+                "Filter by Participant:",
+                ["All Participants"] + sorted_parts,
+                key=f"{prefix}part_sel"
+            )
+            selected_participant = None if part_filter == "All Participants" else part_filter
+
+        with col_f2:
+            status_filter = st.selectbox(
+                "Action Item Status:",
+                ["All", "Pending", "In Progress", "Completed"],
+                key=f"{prefix}status_sel"
+            )
+            selected_status = None if status_filter == "All" else status_filter
+
+        with col_f3:
+            title_query = st.text_input(
+                "Meeting Title / Topic Keyword:",
+                placeholder="e.g. Mobile, Architecture, Sprint...",
+                key=f"{prefix}title_kw"
+            )
+            selected_title = title_query.strip() if title_query else None
+
+        with col_f4:
+            date_filter = st.selectbox(
+                "Date Horizon:",
+                ["All History", "Last 7 Days", "Last 30 Days", "Today"],
+                key=f"{prefix}date_sel"
+            )
+            start_date_val = None
+            if date_filter == "Today":
+                start_date_val = datetime.now().strftime("%Y-%m-%d")
+            elif date_filter == "Last 7 Days":
+                start_date_val = (datetime.now().date() - timedelta(days=7)).isoformat()
+            elif date_filter == "Last 30 Days":
+                start_date_val = (datetime.now().date() - timedelta(days=30)).isoformat()
+
+    # 3. Query Database for Historical Insights
+    with st.spinner("📊 Aggregating historical intelligence..."):
+        insights_data = db.get_historical_insights(
+            participant=selected_participant,
+            start_date=start_date_val,
+            status=selected_status,
+            title=selected_title,
+            limit=50
+        )
+
+    # 4. Check for Empty Data State
+    if insights_data["total_meetings"] == 0:
+        st.info("ℹ️ No historical meetings found matching the selected filters. Try broadening your filter criteria.")
+        return
+
+    # 5. Overview KPI Metric Tiles
+    st.markdown("<h4 style='color:#1E1B4B; margin: 16px 0 10px 0;'>📈 Repository Overview KPIs</h4>", unsafe_allow_html=True)
+    kpi_col1, kpi_col2, kpi_col3, kpi_col4, kpi_col5, kpi_col6 = st.columns(6)
+    with kpi_col1:
+        st.metric("Total Meetings", insights_data["total_meetings"])
+    with kpi_col2:
+        st.metric("Total Action Items", insights_data["total_action_items"])
+    with kpi_col3:
+        st.metric("Pending Tasks", insights_data["pending_action_items"])
+    with kpi_col4:
+        st.metric("Completed Tasks", insights_data["completed_action_items"])
+    with kpi_col5:
+        st.metric("Strategic Decisions", insights_data["total_decisions_count"])
+    with kpi_col6:
+        st.metric("Participants", insights_data["unique_participants_count"])
+
+    st.markdown("<div style='height: 12px;'></div>", unsafe_allow_html=True)
+
+    # 6. Pre-Configured Insight Views Tabs
+    v_tab_tasks, v_tab_decs, v_tab_parts, v_tab_dls, v_tab_proj, v_tab_ai = st.tabs([
+        "📋 Tasks & To-Dos",
+        "⚖️ Strategic Decisions",
+        "👥 People & Workload",
+        "⏰ Deadlines Agenda",
+        "📈 Project History",
+        "🤖 AI Insights Generator"
+    ])
+
+    # VIEW 1: Tasks & To-Dos
+    with v_tab_tasks:
+        st.markdown(f"**Found {len(insights_data['action_items'])} action items across historical meetings:**")
+        if not insights_data["action_items"]:
+            st.caption("No action items match the active filters.")
+        else:
+            for act in insights_data["action_items"]:
+                act_id = act["id"]
+                mid = act["meeting_id"]
+                cur_stat = act.get("status", "Pending")
+                with st.container(border=True):
+                    c_t1, c_t2 = st.columns([3.5, 1.5])
+                    with c_t1:
+                        st.markdown(f"**{act['task']}**")
+                        st.caption(f"👤 Assignee: **{act['assignee']}** | 📁 Meeting: **{act['meeting_title']}** (`{mid}`) | ⏰ Deadline: **{act['deadline']}**")
+                        p_badge = {"High": "badge-rose", "Medium": "badge-amber", "Low": "badge-emerald"}.get(act['priority'], "badge-indigo")
+                        st.markdown(f"<span class='badge-vibrant {p_badge}'>Priority: {act['priority']}</span>", unsafe_allow_html=True)
+                    with c_t2:
+                        new_stat = st.selectbox(
+                            "Status",
+                            ["Pending", "In Progress", "Completed"],
+                            index=["Pending", "In Progress", "Completed"].index(cur_stat) if cur_stat in ["Pending", "In Progress", "Completed"] else 0,
+                            key=f"{prefix}act_stat_{act_id}",
+                            label_visibility="collapsed"
+                        )
+                        if new_stat != cur_stat:
+                            db.update_action_item_status(act_id, new_stat)
+                            st.toast(f"Task updated to {new_stat}!", icon="✅")
+                            st.rerun()
+
+    # VIEW 2: Strategic Decisions Ledger
+    with v_tab_decs:
+        st.markdown(f"**Recorded {len(insights_data['decisions'])} strategic decisions across historical meetings:**")
+        if not insights_data["decisions"]:
+            st.caption("No decisions found matching the active filters.")
+        else:
+            for d in insights_data["decisions"]:
+                with st.container(border=True):
+                    st.markdown(f"⚖️ **{d['decision']}**")
+                    st.caption(f"📁 Source: **{d['meeting_title']}** (`{d['meeting_id']}`) &bull; Date: {d['created_at'][:10] if d.get('created_at') else 'N/A'}")
+
+    # VIEW 3: People & Workload
+    with v_tab_parts:
+        st.markdown(f"**{len(insights_data['participants'])} participants identified across meetings:**")
+        if not insights_data["participants"]:
+            st.caption("No participants found matching the active filters.")
+        else:
+            part_cols = st.columns(3)
+            for idx, p in enumerate(insights_data["participants"]):
+                col = part_cols[idx % 3]
+                with col:
+                    with st.container(border=True):
+                        st.markdown(f"<h4 style='margin:0; color:#1E1B4B;'>👤 {p['name']}</h4>", unsafe_allow_html=True)
+                        st.markdown(f"- 📅 Meetings Attended: **{p['meetings_attended']}**")
+                        st.markdown(f"- 📋 Assigned Tasks: **{p['total_tasks']}**")
+                        st.markdown(f"- ⏳ Pending: <b style='color:#D97706;'>{p['pending_tasks']}</b> | ✅ Done: <b style='color:#059669;'>{p['completed_tasks']}</b>", unsafe_allow_html=True)
+
+    # VIEW 4: Deadlines Agenda
+    with v_tab_dls:
+        st.markdown(f"**{len(insights_data['deadlines'])} deadlines and milestones tracked:**")
+        if not insights_data["deadlines"]:
+            st.caption("No deadlines found matching the active filters.")
+        else:
+            for dl in insights_data["deadlines"]:
+                with st.container(border=True):
+                    c_dl1, c_dl2 = st.columns([3, 1])
+                    with c_dl1:
+                        st.markdown(f"⏰ **{dl['deadline']}** — {dl['context']}")
+                        st.caption(f"📁 Source: **{dl['meeting_title']}** (`{dl['meeting_id']}`)")
+                    with c_dl2:
+                        st.markdown(f"<span class='badge-vibrant badge-indigo'>{dl['status']}</span>", unsafe_allow_html=True)
+
+    # VIEW 5: Project History
+    with v_tab_proj:
+        st.markdown(f"**Chronological timeline of {len(insights_data['project_history'])} meetings:**")
+        for ph in insights_data["project_history"]:
+            with st.container(border=True):
+                st.markdown(f"📅 **{ph['date']}** &bull; **{ph['title']}** (`{ph['meeting_id']}`)")
+                if ph.get("summary"):
+                    st.markdown(f"_{ph['summary']}_")
+                if ph.get("key_decisions"):
+                    st.markdown("**Key Decisions:**\n" + "\n".join([f"- {kd}" for kd in ph["key_decisions"]]))
+
+    # VIEW 6: AI Insights Generator
+    with v_tab_ai:
+        st.markdown("<h4 style='color:#1E1B4B; margin:0 0 6px 0;'>🤖 Cross-Meeting AI Synthesis</h4>", unsafe_allow_html=True)
+        st.caption("Ask questions across multiple meetings. Answers are strictly grounded in historical records with source meeting ID attribution.")
+
+        suggested_ins_queries = [
+            "What are all pending action items across meetings?",
+            "Summarize all key decisions made across historical meetings",
+            "What are Priya's responsibilities across all projects?",
+            "Provide a chronological history of the mobile application launch",
+            "What upcoming deadlines must the team meet?"
+        ]
+        ai_cols = st.columns(3)
+        for idx, sq in enumerate(suggested_ins_queries):
+            c = ai_cols[idx % 3]
+            with c:
+                if st.button(f"💡 {sq}", key=f"{prefix}ai_chip_{idx}", use_container_width=True):
+                    st.session_state[f"{prefix}ai_input"] = sq
+                    st.session_state[f"{prefix}ai_run"] = True
+                    st.rerun()
+
+        ai_q_val = st.session_state.get(f"{prefix}ai_input", "")
+        with st.container(border=True):
+            user_ai_q = st.text_input(
+                "Ask for a cross-meeting insight or summary:",
+                value=ai_q_val,
+                placeholder="e.g. Summarize all decisions made about backend architecture across all meetings",
+                key=f"{prefix}user_ai_q"
+            )
+            col_b1, col_b2 = st.columns([2, 3])
+            with col_b1:
+                run_ai_btn = st.button("🧠 Generate Historical Insight", type="primary", key=f"{prefix}run_ai_btn", use_container_width=True)
+            with col_b2:
+                if st.button("🧹 Clear", key=f"{prefix}clear_ai_btn"):
+                    st.session_state[f"{prefix}ai_input"] = ""
+                    st.session_state[f"{prefix}ai_res"] = None
+                    st.session_state[f"{prefix}ai_run"] = False
+                    st.rerun()
+
+        if run_ai_btn or st.session_state.get(f"{prefix}ai_run", False):
+            st.session_state[f"{prefix}ai_run"] = False
+            clean_q = user_ai_q.strip()
+            if not clean_q:
+                st.warning("⚠️ Please enter a question or choose a suggested query above.")
+            else:
+                with st.spinner("🧠 Synthesizing cross-meeting historical insight..."):
+                    try:
+                        ai_insight_res = ai_search.generate_historical_insight(
+                            clean_q,
+                            topic=selected_title,
+                            participant=selected_participant
+                        )
+                        st.session_state[f"{prefix}ai_res"] = ai_insight_res
+                        st.session_state[f"{prefix}ai_input"] = clean_q
+                    except Exception as err:
+                        st.error(f"❌ Error synthesizing insight: {err}")
+
+        cur_ai_res = st.session_state.get(f"{prefix}ai_res")
+        if cur_ai_res:
+            st.markdown("<div style='height: 12px;'></div>", unsafe_allow_html=True)
+            if cur_ai_res.get("found"):
+                st.markdown(
+                    f"""
+                    <div style="background: #FFFFFF; border: 1.5px solid #6366F1; border-left: 6px solid #6366F1; border-radius: 12px; padding: 22px 24px; box-shadow: 0 6px 20px rgba(99, 102, 241, 0.12); margin-bottom: 20px;">
+                        <div style="display: flex; align-items: center; justify-content: space-between; margin-bottom: 10px; flex-wrap: wrap; gap: 8px;">
+                            <div style="display: flex; align-items: center; gap: 8px;">
+                                <span style="font-size: 1.3rem;">💡</span>
+                                <span style="font-weight: 800; font-size: 1.1rem; color: #312E81;">AI Cross-Meeting Historical Insight</span>
+                            </div>
+                            <span class="badge-vibrant badge-emerald">✅ Grounded in Repository</span>
+                        </div>
+                        <div style="font-size: 1rem; color: #1E293B; line-height: 1.65; white-space: pre-wrap; font-weight: 500;">
+{cur_ai_res.get('answer')}
+                        </div>
+                    </div>
+                    """,
+                    unsafe_allow_html=True
+                )
+                if cur_ai_res.get("source_meeting_ids"):
+                    badges = " ".join([f"<span class='badge-vibrant badge-indigo' style='font-size:0.82rem;'>📌 ID: {sid}</span>" for sid in cur_ai_res["source_meeting_ids"]])
+                    st.markdown(f"<div style='display:flex; gap:8px; flex-wrap:wrap; margin-bottom:12px;'>{badges}</div>", unsafe_allow_html=True)
+            else:
+                st.markdown(
+                    f"""
+                    <div style="background: #FFFBEB; border: 1.5px solid #F59E0B; border-left: 6px solid #F59E0B; border-radius: 12px; padding: 18px 22px; margin-bottom: 16px;">
+                        <div style="font-weight: 700; color: #92400E; margin-bottom: 4px;">ℹ️ Insufficient Historical Data</div>
+                        <div style="font-size: 0.95rem; color: #78350F;">
+                            {cur_ai_res.get('answer')}
+                        </div>
+                    </div>
+                    """,
+                    unsafe_allow_html=True
+                )
+
+
+# -----------------------------------------------------------------------------
+# 6. SECTION ROUTING: MEETING NOTES vs ACCURACY CHECKER
 # -----------------------------------------------------------------------------
 if app_section == "🎙️ Meeting Notes":
     # Header: Clean & simple words
@@ -739,13 +1063,15 @@ if app_section == "🎙️ Meeting Notes":
                             st.toast("Sample Meeting loaded!", icon="🎉")
                             st.rerun()
 
-    # 5 Clean Tabs (Accuracy is in its own separate page!)
-    tab_upload, tab_summary, tab_people, tab_transcript, tab_saved = st.tabs([
+    # 7 Clean Tabs (Accuracy is in its own separate page!)
+    tab_upload, tab_summary, tab_people, tab_transcript, tab_saved, tab_ai, tab_insights = st.tabs([
         "🎙️ Upload Audio",
         "📋 Summary & Tasks",
         "👥 People",
         "📝 Transcript",
-        "📁 Saved Meetings"
+        "📁 Saved Meetings",
+        "🤖 Ask AI",
+        "📊 Historical Insights"
     ])
 
     # -------------------------------------------------------------------------
@@ -1116,12 +1442,46 @@ if app_section == "🎙️ Meeting Notes":
     # TAB 5: SAVED MEETINGS REPOSITORY
     # -----------------------------------------------------------------------------
     with tab_saved:
-        st.subheader("📁 Enterprise Meeting Knowledge Vault")
-        st.caption("All transcribed meetings stored transactionally in SQLite database.")
+        st.subheader("📁 Enterprise Meeting Knowledge Vault & Search")
+        st.caption("Search across titles, transcripts, summaries, decisions, action items, participants, and deadlines.")
 
-        search_term_db = st.text_input("🔍 Search saved meetings:", placeholder="Search by title, speaker, keyword, or ID...")
-    
-        saved_list = db.search_meetings(search_term_db.strip()) if search_term_db.strip() else db.list_all_meetings()
+        # Search Input & Filter Controls
+        col_s1, col_s2 = st.columns([3, 1])
+        with col_s1:
+            search_term_db = st.text_input(
+                "🔍 Search Knowledge Repository:",
+                placeholder="Search keywords across transcripts, summaries, decisions, tasks, people, deadlines...",
+                key="tab5_search_input"
+            )
+        with col_s2:
+            show_filters = st.checkbox("⚙️ Filters", value=False, key="tab5_toggle_filters")
+
+        filter_participant = ""
+        filter_date = ""
+        filter_title = ""
+
+        if show_filters:
+            with st.container(border=True):
+                col_f1, col_f2, col_f3 = st.columns(3)
+                with col_f1:
+                    filter_participant = st.text_input("👤 Participant:", placeholder="e.g. Priyanshu, Ravi", key="tab5_f_part")
+                with col_f2:
+                    filter_date = st.text_input("📅 Date (YYYY-MM-DD):", placeholder="e.g. 2026-09", key="tab5_f_date")
+                with col_f3:
+                    filter_title = st.text_input("🏷️ Title Substring:", placeholder="e.g. Architecture, Sprint", key="tab5_f_title")
+
+        # Execute Search
+        has_any_query = bool(search_term_db.strip() or filter_participant.strip() or filter_date.strip() or filter_title.strip())
+        if has_any_query:
+            saved_list = db.search_meetings(
+                query=search_term_db.strip(),
+                participant=filter_participant.strip(),
+                date=filter_date.strip(),
+                title=filter_title.strip()
+            )
+            st.markdown(f"<p style='font-size: 0.85rem; color: #4F46E5; font-weight: 600; margin: 4px 0 12px 0;'>🔍 Found {len(saved_list)} meeting(s) matching your criteria</p>", unsafe_allow_html=True)
+        else:
+            saved_list = db.list_all_meetings()
 
         if saved_list:
             for m in saved_list:
@@ -1135,6 +1495,12 @@ if app_section == "🎙️ Meeting Notes":
                     with col_head2:
                         current_badge = " :green[**● Current**]" if is_active_session else ""
                         st.markdown(f"`ID: {mid}` &nbsp; `Tasks: {m.get('action_count', 0)}`{current_badge}")
+
+                    # Display matched fields badges if available
+                    matched_fields = m.get("matched_fields", [])
+                    if matched_fields:
+                        badges_html = " ".join([f"<span style='background-color: #EEF2FF; color: #4338CA; padding: 2px 8px; border-radius: 6px; font-size: 0.72rem; font-weight: 700; border: 1px solid #C7D2FE; margin-right: 4px;'>🎯 {f.upper()}</span>" for f in matched_fields])
+                        st.markdown(f"<div style='margin-bottom: 6px;'>{badges_html}</div>", unsafe_allow_html=True)
 
                     summary_text = m.get('summary') or 'No summary available.'
                     preview = summary_text[:220] + ("..." if len(summary_text) > 220 else "")
@@ -1162,7 +1528,7 @@ if app_section == "🎙️ Meeting Notes":
                             st.rerun()
 
                     # Expandable Meeting History & Full Record
-                    with st.expander("📖 View Meeting History & Full Notes", expanded=is_active_session):
+                    with st.expander("📖 View Meeting Intelligence & Full Notes", expanded=is_active_session):
                         detail_m = db.get_meeting(mid)
                         if detail_m:
                             if is_active_session:
@@ -1190,6 +1556,26 @@ if app_section == "🎙️ Meeting Notes":
                                 else:
                                     st.caption("No decisions logged.")
 
+                            # Participants and Deadlines Columns
+                            col_p1, col_p2 = st.columns(2)
+                            with col_p1:
+                                st.markdown("**👥 Identified Participants:**")
+                                parts = detail_m.get("participants", [])
+                                if parts:
+                                    parts_chips = " ".join([f"<span style='background-color: #F0FDF4; color: #166534; padding: 2px 8px; border-radius: 6px; font-size: 0.78rem; font-weight: 600; border: 1px solid #BBF7D0; margin-right: 4px; display: inline-block; margin-bottom: 4px;'>👤 {p}</span>" for p in parts])
+                                    st.markdown(f"<div>{parts_chips}</div>", unsafe_allow_html=True)
+                                else:
+                                    st.caption("No participants logged.")
+
+                            with col_p2:
+                                st.markdown("**⏰ Deadlines & Milestones:**")
+                                dls = detail_m.get("deadlines", [])
+                                if dls:
+                                    dl_chips = " ".join([f"<span style='background-color: #FEF2F2; color: #991B1B; padding: 2px 8px; border-radius: 6px; font-size: 0.78rem; font-weight: 600; border: 1px solid #FECACA; margin-right: 4px; display: inline-block; margin-bottom: 4px;'>⏳ {dl}</span>" for dl in dls])
+                                    st.markdown(f"<div>{dl_chips}</div>", unsafe_allow_html=True)
+                                else:
+                                    st.caption("No deadlines specified.")
+
                             # Action items with status update right in Tab 5
                             m_actions = detail_m.get("action_items", [])
                             if m_actions:
@@ -1214,6 +1600,8 @@ if app_section == "🎙️ Meeting Notes":
                                             act['status'] = new_stat
                                             st.toast(f"Task updated to '{new_stat}'!", icon="✅")
                                             st.rerun()
+                            else:
+                                st.caption("No action items recorded.")
 
                             # Transcript
                             t_text = detail_m.get("transcript", "")
@@ -1221,11 +1609,190 @@ if app_section == "🎙️ Meeting Notes":
                                 st.markdown("**📝 Full Transcript Text:**")
                                 st.text_area("Full Transcript", value=t_text, height=200, key=f"t_view_{mid}", disabled=True, label_visibility="collapsed")
         else:
-            st.info("No saved meetings found.")
+            st.info("No saved meetings found matching your search criteria.")
+
+    # -------------------------------------------------------------------------
+    # TAB 6: AI / CONTEXTUAL MEETING SEARCH
+    # -------------------------------------------------------------------------
+    with tab_ai:
+        st.markdown(
+            """
+            <div style="background: linear-gradient(135deg, #1E1B4B 0%, #312E81 50%, #4338CA 100%); border-radius: 14px; padding: 22px 26px; margin-bottom: 20px; color: #FFFFFF !important; box-shadow: 0 4px 16px rgba(49, 46, 129, 0.15);">
+                <div style="display: flex; align-items: center; gap: 12px; margin-bottom: 8px;">
+                    <span style="font-size: 1.8rem;">🤖</span>
+                    <div>
+                        <h3 style="margin: 0; color: #FFFFFF !important; font-size: 1.35rem; font-weight: 800;">Contextual AI Meeting Search & Q&A</h3>
+                        <p style="margin: 3px 0 0 0; font-size: 0.88rem; color: #C7D2FE !important;">
+                            Ask questions in natural language across all historical meeting records. TruthShield AI synthesizes answers grounded strictly in your saved meetings, citing exact source meeting IDs with zero hallucination.
+                        </p>
+                    </div>
+                </div>
+            </div>
+            """,
+            unsafe_allow_html=True
+        )
+
+        # Quick Example Chips
+        st.markdown("<p style='font-size: 0.85rem; font-weight: 700; color: #475569; margin-bottom: 6px;'>💡 Suggested Questions (Click to test):</p>", unsafe_allow_html=True)
+        sample_queries = [
+            "What did we decide about the mobile application?",
+            "What tasks were assigned to Priya?",
+            "What was the status of API integration?",
+            "Which meetings discussed the project launch?",
+            "What deadlines were discussed?",
+            "Who was responsible for UI testing?"
+        ]
+
+        sq_col1, sq_col2, sq_col3 = st.columns(3)
+        for idx, sq in enumerate(sample_queries):
+            target_col = [sq_col1, sq_col2, sq_col3][idx % 3]
+            with target_col:
+                if st.button(f"💬 {sq}", key=f"chip_q_{idx}", use_container_width=True):
+                    st.session_state["ai_query_input_val"] = sq
+                    st.session_state["ai_search_auto_run"] = True
+                    st.rerun()
+
+        st.markdown("<div style='height: 10px;'></div>", unsafe_allow_html=True)
+
+        # Question Input Area
+        query_val = st.session_state.get("ai_query_input_val", "")
+        with st.container(border=True):
+            user_question = st.text_input(
+                "Your Question:",
+                value=query_val,
+                placeholder="Ask anything about your past meetings (e.g. What did we decide about the mobile application?)",
+                key="ai_question_text_input"
+            )
+
+            col_ai_act1, col_ai_act2, col_ai_act3 = st.columns([1.5, 1, 3])
+            with col_ai_act1:
+                search_btn = st.button("🔍 Search with AI", type="primary", use_container_width=True)
+            with col_ai_act2:
+                if st.button("🧹 Clear", use_container_width=True):
+                    st.session_state["ai_query_input_val"] = ""
+                    st.session_state["ai_search_result"] = None
+                    st.session_state["ai_search_auto_run"] = False
+                    st.rerun()
+            with col_ai_act3:
+                st.caption("Answers are validated and synthesized strictly against your SQLite meeting repository.")
+
+        # Execution trigger
+        should_run = search_btn or st.session_state.get("ai_search_auto_run", False)
+        if should_run:
+            st.session_state["ai_search_auto_run"] = False
+            clean_q = user_question.strip()
+            if not clean_q:
+                st.warning("⚠️ Please enter a question or click one of the suggested prompts above.")
+            else:
+                with st.spinner("🧠 Searching knowledge repository & synthesizing answer with AI..."):
+                    try:
+                        res = ai_search.answer_question(clean_q)
+                        st.session_state["ai_search_result"] = res
+                        st.session_state["ai_query_input_val"] = clean_q
+                    except Exception as e:
+                        st.error(f"❌ Error during AI Search: {e}")
+
+        # Display Results
+        ai_res = st.session_state.get("ai_search_result")
+        if ai_res:
+            st.markdown("<div style='height: 14px;'></div>", unsafe_allow_html=True)
+            is_found = ai_res.get("found", False)
+            ans_text = ai_res.get("answer", "")
+            src_ids = ai_res.get("source_meeting_ids", [])
+            src_meetings = ai_res.get("source_meetings", [])
+            exec_time = ai_res.get("execution_time_seconds", 0.0)
+
+            if is_found:
+                # Grounded Answer Card
+                st.markdown(
+                    f"""
+                    <div style="background: #FFFFFF; border: 1.5px solid #10B981; border-left: 6px solid #10B981; border-radius: 12px; padding: 22px 24px; box-shadow: 0 6px 20px rgba(16, 185, 129, 0.12); margin-bottom: 20px;">
+                        <div style="display: flex; align-items: center; justify-content: space-between; margin-bottom: 12px; flex-wrap: wrap; gap: 8px;">
+                            <div style="display: flex; align-items: center; gap: 8px;">
+                                <span style="font-size: 1.3rem;">💡</span>
+                                <span style="font-weight: 800; font-size: 1.1rem; color: #065F46;">AI Synthesized Answer</span>
+                            </div>
+                            <div style="display: flex; gap: 6px; align-items: center;">
+                                <span class="badge-vibrant badge-emerald">✅ Grounded in Repository</span>
+                                <span class="badge-vibrant badge-indigo">⚡ {exec_time:.2f}s</span>
+                            </div>
+                        </div>
+                        <div style="font-size: 1rem; color: #1E293B; line-height: 1.65; white-space: pre-wrap; font-weight: 500;">
+{ans_text}
+                        </div>
+                    </div>
+                    """,
+                    unsafe_allow_html=True
+                )
+
+                # Source Meeting IDs badges
+                st.markdown("<h4 style='color: #1E1B4B; margin: 18px 0 8px 0;'>📁 Source Meeting Records</h4>", unsafe_allow_html=True)
+                if src_ids:
+                    chips_html = " ".join([f"<span class='badge-vibrant badge-indigo' style='font-size: 0.85rem; padding: 5px 12px;'>📌 ID: {sid}</span>" for sid in src_ids])
+                    st.markdown(f"<div style='display: flex; gap: 8px; flex-wrap: wrap; margin-bottom: 14px;'>{chips_html}</div>", unsafe_allow_html=True)
+
+                # Detailed meeting cards
+                for sm in src_meetings:
+                    sm_id = sm.get("meeting_id", "")
+                    sm_title = sm.get("title", "Untitled Meeting")
+                    sm_score = sm.get("relevance_score", 0)
+                    with st.expander(f"📄 {sm_title} (ID: {sm_id}) • Relevance Score: {sm_score} pts", expanded=False):
+                        sm_col1, sm_col2 = st.columns([3, 1])
+                        with sm_col1:
+                            st.markdown(f"**Date:** {sm.get('created_at', 'N/A')} | **Duration:** {sm.get('duration_seconds', 0.0):.1f}s")
+                            if sm.get("summary"):
+                                st.markdown(f"**Summary:** {sm.get('summary')}")
+                            if sm.get("decisions"):
+                                st.markdown(f"**Key Decisions:**\n" + "\n".join([f"- {d}" for d in sm.get("decisions", [])]))
+                            if sm.get("action_items"):
+                                st.markdown(f"**Action Items:**")
+                                for it in sm.get("action_items", []):
+                                    st.markdown(f"- **{it.get('task')}** → {it.get('assignee')} (Deadline: {it.get('deadline')}, Priority: {it.get('priority')})")
+                        with sm_col2:
+                            if st.button("📂 Open Meeting", key=f"ai_open_{sm_id}", use_container_width=True):
+                                st.session_state["active_meeting_id"] = sm_id
+                                st.session_state["active_meeting"] = db.get_meeting(sm_id)
+                                st.toast(f"Switched active meeting to {sm_title}!", icon="📂")
+                                st.rerun()
+
+            else:
+                # Information not found card
+                st.markdown(
+                    f"""
+                    <div style="background: #FFFBEB; border: 1.5px solid #F59E0B; border-left: 6px solid #F59E0B; border-radius: 12px; padding: 20px 24px; box-shadow: 0 4px 14px rgba(245, 158, 11, 0.1); margin-bottom: 20px;">
+                        <div style="display: flex; align-items: center; justify-content: space-between; margin-bottom: 8px;">
+                            <div style="display: flex; align-items: center; gap: 8px;">
+                                <span style="font-size: 1.3rem;">ℹ️</span>
+                                <span style="font-weight: 800; font-size: 1.05rem; color: #92400E;">Information Not Found</span>
+                            </div>
+                            <span class="badge-vibrant badge-amber">⚡ {exec_time:.2f}s</span>
+                        </div>
+                        <div style="font-size: 0.96rem; color: #78350F; line-height: 1.6;">
+                            {ans_text}
+                        </div>
+                        <div style="margin-top: 10px; font-size: 0.85rem; color: #B45309;">
+                            💡 <b>Tip:</b> Try rephrasing your question or search directly by keywords in the <b>📁 Saved Meetings</b> tab.
+                        </div>
+                    </div>
+                    """,
+                    unsafe_allow_html=True
+                )
+
+    # -------------------------------------------------------------------------
+    # TAB 7: HISTORICAL MEETING INSIGHTS
+    # -------------------------------------------------------------------------
+    with tab_insights:
+        render_historical_insights(is_tab=True)
 
 
 # -----------------------------------------------------------------------------
-# 6. ACCURACY CHECKER STUDIO
+# 7. HISTORICAL INSIGHTS FULL PAGE VIEW
+# -----------------------------------------------------------------------------
+elif app_section == "📊 Historical Insights":
+    render_historical_insights(is_tab=False)
+
+# -----------------------------------------------------------------------------
+# 8. ACCURACY CHECKER STUDIO
 # -----------------------------------------------------------------------------
 elif app_section == "🎯 Accuracy Checker":
     st.markdown(
