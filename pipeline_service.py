@@ -25,7 +25,8 @@ class ProcessingPipeline:
         self,
         audio_file_path: str,
         meeting_title: str = None,
-        custom_meeting_id: str = None
+        custom_meeting_id: str = None,
+        user_id: int = 1
     ) -> Tuple[bool, Dict[str, Any], str]:
         """
         Executes the end-to-end processing pipeline for a given audio file.
@@ -124,7 +125,8 @@ class ProcessingPipeline:
             transcript=raw_transcript,
             intelligence=llm_data,
             participant_data=participant_data,
-            validation_info=validation_info
+            validation_info=validation_info,
+            user_id=user_id
         )
 
         pipeline_result = {

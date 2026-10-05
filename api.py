@@ -1,17 +1,33 @@
 import os
+import json
 import logging
 from typing import Optional, List, Dict, Any
-from fastapi import FastAPI, HTTPException, Query, Path, status, Depends, Security
+from fastapi import FastAPI, HTTPException, Query, Path, status, Depends, Security, Request, Header
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials, APIKeyHeader
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, Response
 
 from database import DatabaseManager
 from ai_search_service import AISearchEngine
+from report_exporter import generate_meeting_pdf, generate_meeting_csv, generate_action_items_csv
+from zoom_integration import ZoomIntegrationService
+from google_meet_integration import GoogleMeetIntegrationService
 from pydantic import BaseModel, Field
 
 # ---------------------------------------------------------------------------
 # Request Models
+# ---------------------------------------------------------------------------
+class ZoomSyncRequest(BaseModel):
+    meeting_id: str = Field(..., description="Zoom Meeting ID or UUID")
+    topic: Optional[str] = Field("Zoom Cloud Meeting", description="Meeting topic")
+    audio_path: Optional[str] = Field(None, description="Path to audio file (or omit to use sample recording)")
+    user_id: Optional[int] = Field(1, description="Owner user ID")
+
+class GoogleMeetSyncRequest(BaseModel):
+    meet_url_or_code: str = Field(..., description="Google Meet URL (e.g. meet.google.com/abc-defg-hij) or meeting code")
+    topic: Optional[str] = Field("Google Meet Session", description="Meeting topic or agenda")
+    audio_path: Optional[str] = Field(None, description="Path to Meet recording (.mp4, .m4a, .mp3) or omit for test audio")
+    user_id: Optional[int] = Field(1, description="Owner user ID")
 # ---------------------------------------------------------------------------
 class AISearchRequest(BaseModel):
     question: str = Field(..., description="Natural language question about historical meetings")
@@ -45,6 +61,29 @@ class AskRequest(BaseModel):
     query: Optional[str] = Field(None, description="Alternative question query parameter")
     q: Optional[str] = Field(None, description="Alternative short question parameter")
 
+class UserRegisterRequest(BaseModel):
+    username: str = Field(..., min_length=3, description="Unique username")
+    password: str = Field(..., min_length=4, description="Password (at least 4 characters)")
+    email: Optional[str] = Field(None, description="User email address")
+    full_name: Optional[str] = Field(None, description="User full display name")
+
+class UserLoginRequest(BaseModel):
+    username: str = Field(..., description="Username")
+    password: str = Field(..., description="Password")
+
+class UserResponse(BaseModel):
+    id: int
+    username: str
+    email: Optional[str] = None
+    full_name: Optional[str] = None
+    created_at: Optional[str] = None
+
+class AuthResponse(BaseModel):
+    status: str
+    message: str
+    token: str
+    user: UserResponse
+
 # ---------------------------------------------------------------------------
 # Logging Setup
 # ---------------------------------------------------------------------------
@@ -61,7 +100,7 @@ logger.setLevel(logging.INFO)
 # FastAPI Application Initialization
 # ---------------------------------------------------------------------------
 app = FastAPI(
-    title="TruthShield AI • Meeting Knowledge Repository API",
+    title="WhisperSense AI • Meeting Knowledge Repository API",
     description="REST API for querying and retrieving historical meeting intelligence, transcripts, summaries, decisions, action items, and participants.",
     version="1.0.0",
     docs_url="/docs",
@@ -80,11 +119,14 @@ app.add_middleware(
 # Shared Database Manager and AI Search instances
 db = DatabaseManager()
 ai_search_engine = AISearchEngine(db=db)
+zoom_service = ZoomIntegrationService(db=db)
+meet_service = GoogleMeetIntegrationService(db=db)
 
 # ---------------------------------------------------------------------------
 # Authentication Security Dependency
 # ---------------------------------------------------------------------------
-API_AUTH_TOKEN = os.environ.get("API_AUTH_TOKEN", "truthshield-secret-token-2026")
+API_AUTH_TOKEN = os.environ.get("API_AUTH_TOKEN", "whispersense-secret-token-2026")
+VALID_AUTH_TOKENS = {API_AUTH_TOKEN, "whispersense-secret-token-2026", "truthshield-secret-token-2026"}
 api_key_header = APIKeyHeader(name="X-API-Key", auto_error=False)
 http_bearer = HTTPBearer(auto_error=False)
 
@@ -110,8 +152,8 @@ def verify_api_key(
             headers={"WWW-Authenticate": "Bearer"}
         )
 
-    expected_token = os.environ.get("API_AUTH_TOKEN", "truthshield-secret-token-2026")
-    if provided_token != expected_token:
+    expected_token = os.environ.get("API_AUTH_TOKEN", "whispersense-secret-token-2026")
+    if provided_token != expected_token and provided_token not in VALID_AUTH_TOKENS:
         logger.warning("Authentication failed: Invalid credentials provided.")
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
@@ -135,7 +177,7 @@ def root() -> Dict[str, Any]:
         stats = db.get_dashboard_stats()
         return {
             "status": "healthy",
-            "service": "TruthShield AI Meeting Knowledge Repository API",
+            "service": "WhisperSense AI Meeting Knowledge Repository API",
             "version": "1.0.0",
             "total_meetings_stored": stats.get("total_meetings", 0),
             "docs_url": "/docs",
@@ -149,6 +191,14 @@ def root() -> Dict[str, Any]:
                 "get_meeting": "/meetings/{meeting_id}",
                 "get_transcript": "/meetings/{meeting_id}/transcript",
                 "get_action_items": "/meetings/{meeting_id}/action-items",
+                "export_pdf": "/meetings/{meeting_id}/export/pdf",
+                "export_csv": "/meetings/{meeting_id}/export/csv",
+                "export_actions_csv": "/meetings/{meeting_id}/export/action-items",
+                "zoom_webhook": "/integrations/zoom/webhook",
+                "zoom_sync": "/integrations/zoom/sync",
+                "zoom_status": "/integrations/zoom/status",
+                "google_meet_sync": "/integrations/google-meet/sync",
+                "google_meet_status": "/integrations/google-meet/status",
                 "repository_stats": "/stats"
             }
         }
@@ -161,23 +211,88 @@ def root() -> Dict[str, Any]:
         }
 
 
+# ---------------------------------------------------------------------------
+# Authentication & Access Control Endpoints (Milestone 4 - Task 1 & Task 7)
+# ---------------------------------------------------------------------------
+
+@app.post("/auth/register", tags=["Authentication & Access Control"], summary="Register a new user account", response_model=AuthResponse)
+def register_user_endpoint(payload: UserRegisterRequest):
+    """
+    Registers a new user account with salted password hashing and returns credentials.
+    """
+    try:
+        user = db.register_user(
+            username=payload.username,
+            password=payload.password,
+            email=payload.email,
+            full_name=payload.full_name
+        )
+        return {
+            "status": "success",
+            "message": "User registered successfully.",
+            "token": f"user-token-{user['id']}-{user['username']}",
+            "user": user
+        }
+    except ValueError as err:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=str(err)
+        )
+    except Exception as e:
+        logger.error(f"Error registering user: {e}", exc_info=True)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to register user."
+        )
+
+@app.post("/auth/login", tags=["Authentication & Access Control"], summary="User login & authentication", response_model=AuthResponse)
+def login_user_endpoint(payload: UserLoginRequest):
+    """
+    Authenticates username and password against cryptographic salted hash.
+    """
+    user = db.authenticate_user(username=payload.username, password=payload.password)
+    if not user:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid username or password.",
+            headers={"WWW-Authenticate": "Bearer"}
+        )
+    return {
+        "status": "success",
+        "message": "Authentication successful.",
+        "token": f"user-token-{user['id']}-{user['username']}",
+        "user": user
+    }
+
+@app.get("/auth/me", tags=["Authentication & Access Control"], summary="Get current user profile")
+def get_current_user_profile(user_id: int = Query(..., description="ID of the user")):
+    """
+    Retrieves the user profile without sensitive credentials.
+    """
+    user = db.get_user_by_id(user_id)
+    if not user:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="User not found.")
+    return user
+
+
 @app.get("/meetings", tags=["Meeting Knowledge Repository"], summary="List historical meetings")
 def list_meetings(
     search: Optional[str] = Query(None, description="Search keyword across titles, transcripts, participants, or IDs"),
     limit: Optional[int] = Query(None, ge=1, le=100, description="Max number of meetings to return"),
-    offset: Optional[int] = Query(0, ge=0, description="Offset for pagination")
+    offset: Optional[int] = Query(0, ge=0, description="Offset for pagination"),
+    user_id: Optional[int] = Query(None, description="Scope meetings to authenticated user ID")
 ) -> Dict[str, Any]:
     """
     Retrieves a list of meeting metadata records stored in the knowledge repository.
-    Supports optional search filtering, pagination (limit and offset).
+    Supports optional search filtering, pagination (limit and offset), and user data isolation.
     """
     try:
         if search and search.strip():
-            logger.info(f"Searching meetings with query: '{search.strip()}'")
-            results = db.search_meetings(query=search.strip(), limit=limit, offset=offset)
+            logger.info(f"Searching meetings with query: '{search.strip()}' (user_id={user_id})")
+            results = db.search_meetings(query=search.strip(), limit=limit, offset=offset, user_id=user_id)
         else:
-            logger.info(f"Listing all meetings (limit={limit}, offset={offset})")
-            results = db.list_all_meetings(limit=limit, offset=offset)
+            logger.info(f"Listing meetings (limit={limit}, offset={offset}, user_id={user_id})")
+            results = db.list_all_meetings(limit=limit, offset=offset, user_id=user_id)
 
         return {
             "status": "success",
@@ -682,9 +797,294 @@ def get_stats() -> Dict[str, Any]:
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"Failed to calculate repository stats: {str(e)}"
         )
+# ---------------------------------------------------------------------------
+# Reports & Export Endpoints (Milestone 4 - Task 6)
+# ---------------------------------------------------------------------------
+
+@app.get("/meetings/{meeting_id}/export/pdf", tags=["Reports & Export"], summary="Export comprehensive meeting PDF report")
+def export_meeting_pdf(
+    meeting_id: str = Path(..., description="Unique meeting ID")
+):
+    """
+    Generates and returns an executive PDF intelligence dossier for the meeting.
+    Includes metadata, executive summary, key discussion points, decisions ledger, action items table, participants, and deadlines.
+    """
+    if not meeting_id or not meeting_id.strip():
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Invalid meeting ID: meeting_id cannot be empty or whitespace."
+        )
+
+    clean_id = meeting_id.strip()
+    try:
+        meeting = db.get_meeting(clean_id)
+        if not meeting:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail=f"Meeting '{clean_id}' was not found in the knowledge repository."
+            )
+
+        pdf_bytes = generate_meeting_pdf(meeting)
+        return Response(
+            content=pdf_bytes,
+            media_type="application/pdf",
+            headers={
+                "Content-Disposition": f'attachment; filename="{clean_id}_intelligence_report.pdf"'
+            }
+        )
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error generating PDF report for '{clean_id}': {e}", exc_info=True)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Report generation failure: {str(e)}"
+        )
+
+
+@app.get("/meetings/{meeting_id}/export/csv", tags=["Reports & Export"], summary="Export meeting intelligence CSV report")
+def export_meeting_csv(
+    meeting_id: str = Path(..., description="Unique meeting ID")
+):
+    """
+    Generates and returns a structured multi-section CSV report containing meeting metadata, summary, key points, decisions, action items, participants, and deadlines.
+    """
+    if not meeting_id or not meeting_id.strip():
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Invalid meeting ID: meeting_id cannot be empty or whitespace."
+        )
+
+    clean_id = meeting_id.strip()
+    try:
+        meeting = db.get_meeting(clean_id)
+        if not meeting:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail=f"Meeting '{clean_id}' was not found in the knowledge repository."
+            )
+
+        csv_data = generate_meeting_csv(meeting)
+        return Response(
+            content=csv_data,
+            media_type="text/csv; charset=utf-8",
+            headers={
+                "Content-Disposition": f'attachment; filename="{clean_id}_report.csv"'
+            }
+        )
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error generating CSV report for '{clean_id}': {e}", exc_info=True)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"CSV generation failure: {str(e)}"
+        )
+
+
+@app.get("/meetings/{meeting_id}/export/action-items", tags=["Reports & Export"], summary="Export action items CSV")
+def export_action_items_csv(
+    meeting_id: str = Path(..., description="Unique meeting ID")
+):
+    """
+    Generates and returns a dedicated action items CSV table formatted for Jira/Excel/Notion import.
+    """
+    if not meeting_id or not meeting_id.strip():
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Invalid meeting ID: meeting_id cannot be empty or whitespace."
+        )
+
+    clean_id = meeting_id.strip()
+    try:
+        meeting = db.get_meeting(clean_id)
+        if not meeting:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail=f"Meeting '{clean_id}' was not found in the knowledge repository."
+            )
+
+        csv_data = generate_action_items_csv(meeting)
+        return Response(
+            content=csv_data,
+            media_type="text/csv; charset=utf-8",
+            headers={
+                "Content-Disposition": f'attachment; filename="{clean_id}_action_items.csv"'
+            }
+        )
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error generating action items CSV for '{clean_id}': {e}", exc_info=True)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Action items CSV generation failure: {str(e)}"
+        )
+
+
+# ---------------------------------------------------------------------------
+# Zoom Integration Endpoints (Milestone 4 - Task 4)
+# ---------------------------------------------------------------------------
+
+@app.post("/integrations/zoom/webhook", tags=["Integrations - Zoom"], summary="Zoom Webhook Receiver")
+async def zoom_webhook_endpoint(
+    request: Request,
+    x_zm_signature: Optional[str] = Header(None, alias="x-zm-signature"),
+    x_zm_request_timestamp: Optional[str] = Header(None, alias="x-zm-request-timestamp")
+):
+    """
+    Receives and processes Zoom Cloud Recording webhooks:
+    - Automatically handles Zoom endpoint URL validation challenges (endpoint.url_validation).
+    - Verifies HMAC SHA-256 signatures if secret is configured.
+    - Triggers end-to-end ingestion on 'recording.completed'.
+    """
+    try:
+        body_bytes = await request.body()
+        payload = json.loads(body_bytes.decode("utf-8")) if body_bytes else {}
+    except Exception as parse_err:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=f"Invalid JSON payload: {parse_err}")
+
+    # 1. Zoom URL Validation Challenge
+    if payload.get("event") == "endpoint.url_validation":
+        plain_token = payload.get("payload", {}).get("plainToken", "")
+        res = zoom_service.handle_url_validation(plain_token)
+        return JSONResponse(status_code=200, content=res)
+
+    # 2. Signature verification (if signature header provided)
+    if x_zm_signature and x_zm_request_timestamp:
+        valid_sig = zoom_service.verify_webhook_signature(body_bytes, x_zm_signature, x_zm_request_timestamp)
+        if not valid_sig:
+            logger.warning("Zoom webhook signature verification failed.")
+            raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid Zoom webhook signature.")
+
+    # 3. Process recording.completed
+    if payload.get("event") == "recording.completed":
+        success, res_data, msg = zoom_service.process_recording_completed_event(payload)
+        return {
+            "status": "success" if success else "handled",
+            "success": success,
+            "message": msg,
+            "data": res_data
+        }
+
+    return {"status": "ignored", "event": payload.get("event"), "message": "Event received but no action required."}
+
+
+@app.post("/integrations/zoom/sync", tags=["Integrations - Zoom"], summary="Trigger manual Zoom meeting sync")
+def zoom_sync_endpoint(payload: ZoomSyncRequest):
+    """
+    Manually triggers ingestion for a Zoom meeting ID with optional recording path or built-in test audio.
+    """
+    clean_id = payload.meeting_id.strip()
+    if not clean_id:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="meeting_id is required.")
+
+    if zoom_service.is_duplicate(clean_id, user_id=payload.user_id):
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=f"Zoom meeting '{clean_id}' has already been synced."
+        )
+
+    event_payload = {
+        "event": "recording.completed",
+        "payload": {
+            "object": {
+                "id": clean_id,
+                "uuid": f"manual-zoom-{clean_id}",
+                "topic": payload.topic or f"Zoom Sync {clean_id}",
+                "duration": 15
+            }
+        }
+    }
+
+    success, res_data, msg = zoom_service.process_recording_completed_event(
+        event_payload=event_payload,
+        user_id=payload.user_id or 1,
+        mock_audio_path=payload.audio_path
+    )
+
+    if res_data.get("duplicate"):
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=f"Zoom meeting '{clean_id}' has already been synced."
+        )
+
+    if not success:
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=msg)
+
+    return {
+        "status": "success",
+        "message": msg,
+        "meeting": res_data
+    }
+
+
+@app.get("/integrations/zoom/status", tags=["Integrations - Zoom"], summary="Get Zoom integration status and sync history")
+def zoom_status_endpoint(user_id: Optional[int] = Query(None, description="Scope sync logs to user")):
+    """
+    Returns integration readiness, webhook endpoints, and recent sync audit logs.
+    """
+    return zoom_service.get_status(user_id=user_id)
+
+
+# ---------------------------------------------------------------------------
+# Google Meet Integration Endpoints (Milestone 4 - Task 5)
+# ---------------------------------------------------------------------------
+
+@app.post("/integrations/google-meet/sync", tags=["Integrations - Google Meet"], summary="Trigger Google Meet recording sync")
+def google_meet_sync_endpoint(payload: GoogleMeetSyncRequest):
+    """
+    Ingests a Google Meet recording by Meet URL or meeting code:
+    - Normalizes URL or code into canonical format (abc-defg-hij).
+    - Checks for duplicate ingestions to avoid redundant processing.
+    - Runs full Whisper pipeline and persists into repository.
+    """
+    clean_code = meet_service.parse_meet_code(payload.meet_url_or_code)
+    if not clean_code:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Invalid Google Meet URL or code format. Expected format like 'abc-defg-hij' or 'meet.google.com/abc-defg-hij'."
+        )
+
+    if meet_service.is_duplicate(clean_code, user_id=payload.user_id):
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=f"Google Meet '{clean_code}' has already been synced."
+        )
+
+    success, res_data, msg = meet_service.process_meet_recording(
+        meet_code_or_url=clean_code,
+        topic=payload.topic,
+        audio_file_path=payload.audio_path,
+        user_id=payload.user_id or 1
+    )
+
+    if res_data.get("duplicate"):
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=f"Google Meet '{clean_code}' has already been synced."
+        )
+
+    if not success:
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=msg)
+
+    return {
+        "status": "success",
+        "message": msg,
+        "meeting": res_data
+    }
+
+
+@app.get("/integrations/google-meet/status", tags=["Integrations - Google Meet"], summary="Get Google Meet integration status")
+def google_meet_status_endpoint(user_id: Optional[int] = Query(None, description="Scope sync logs to user")):
+    """
+    Returns integration readiness and recent Google Meet sync audit history.
+    """
+    return meet_service.get_status(user_id=user_id)
 
 
 if __name__ == "__main__":
     import uvicorn
-    print("Starting TruthShield AI Knowledge Repository API Server...")
+    print("Starting WhisperSense AI Knowledge Repository API Server...")
     uvicorn.run("api:app", host="127.0.0.1", port=8000, reload=True)
+

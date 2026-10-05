@@ -3,10 +3,34 @@ import sqlite3
 import json
 import uuid
 import logging
+import hashlib
+import secrets
 from datetime import datetime
-from typing import Dict, List, Any, Optional
+from typing import Dict, List, Any, Optional, Tuple
 
 DB_FILE = os.path.join(os.path.dirname(__file__), "whisper_meetings.db")
+
+def hash_password(password: str, salt: Optional[str] = None) -> Tuple[str, str]:
+    """
+    Computes a cryptographic SHA-256 salted hash for the password.
+    Returns (hex_hash, hex_salt).
+    """
+    if not salt:
+        salt = secrets.token_hex(16)
+    pwd_bytes = password.encode('utf-8')
+    salt_bytes = salt.encode('utf-8')
+    pwd_hash = hashlib.sha256(salt_bytes + pwd_bytes).hexdigest()
+    return pwd_hash, salt
+
+def verify_password(password: str, salt: str, expected_hash: str) -> bool:
+    """
+    Constant-time password verification against stored salted hash.
+    """
+    if not password or not salt or not expected_hash:
+        return False
+    pwd_hash, _ = hash_password(password, salt)
+    return secrets.compare_digest(pwd_hash, expected_hash)
+
 
 # ---------------------------------------------------------------------------
 # Structured Logging Setup
@@ -87,13 +111,26 @@ class DatabaseManager:
     def init_db(self):
         """
         Creates required relational database tables if they do not exist.
-        Enforces foreign keys and unique constraints.
+        Enforces foreign keys, unique constraints, and multi-user data isolation.
         """
         try:
             with self.get_connection() as conn:
                 cursor = conn.cursor()
 
-                # 1. Meetings Core Table
+                # 0. Users Core Table (Task 1 & Task 7: Multi-User Authentication & Access Control)
+                cursor.execute("""
+                    CREATE TABLE IF NOT EXISTS users (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        username TEXT UNIQUE NOT NULL,
+                        password_hash TEXT NOT NULL,
+                        salt TEXT NOT NULL,
+                        email TEXT,
+                        full_name TEXT,
+                        created_at TEXT NOT NULL
+                    )
+                """)
+
+                # 1. Meetings Core Table (with user_id for multi-user isolation)
                 cursor.execute("""
                     CREATE TABLE IF NOT EXISTS meetings (
                         meeting_id TEXT PRIMARY KEY,
@@ -106,9 +143,31 @@ class DatabaseManager:
                         transcript TEXT NOT NULL,
                         word_count INTEGER,
                         validation_status TEXT,
-                        created_at TEXT NOT NULL
+                        created_at TEXT NOT NULL,
+                        user_id INTEGER DEFAULT 1,
+                        FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE SET NULL
                     )
                 """)
+
+                # Check if user_id column exists on meetings for migration
+                cursor.execute("PRAGMA table_info(meetings)")
+                cols = [r["name"] for r in cursor.fetchall()]
+                if "user_id" not in cols:
+                    cursor.execute("ALTER TABLE meetings ADD COLUMN user_id INTEGER DEFAULT NULL")
+
+                # Ensure default demo user exists (demo / demo123)
+                cursor.execute("SELECT COUNT(*) as count FROM users")
+                if cursor.fetchone()["count"] == 0:
+                    demo_salt = secrets.token_hex(16)
+                    demo_hash, _ = hash_password("demo123", demo_salt)
+                    now_str = datetime.now().isoformat()
+                    cursor.execute("""
+                        INSERT INTO users (id, username, password_hash, salt, email, full_name, created_at)
+                        VALUES (1, 'demo', ?, ?, 'demo@whispersense.ai', 'Demo Account', ?)
+                    """, (demo_hash, demo_salt, now_str))
+
+                # Ensure any pre-existing meetings have a valid user_id
+                cursor.execute("UPDATE meetings SET user_id = 1 WHERE user_id IS NULL")
 
                 # 2. Summaries & Intelligence Table
                 cursor.execute("""
@@ -164,11 +223,135 @@ class DatabaseManager:
                     )
                 """)
 
+                # 6. Integration Sync Logs Table (Milestone 4 - Tasks 4 & 5)
+                cursor.execute("""
+                    CREATE TABLE IF NOT EXISTS integration_logs (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        source TEXT NOT NULL,
+                        external_meeting_id TEXT NOT NULL,
+                        internal_meeting_id TEXT,
+                        title TEXT,
+                        status TEXT NOT NULL,
+                        details TEXT,
+                        created_at TEXT NOT NULL,
+                        user_id INTEGER DEFAULT 1,
+                        FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE SET NULL
+                    )
+                """)
+
+                # Performance & Retrieval Indexes (Milestone 4 - Task 9)
+                cursor.execute("CREATE INDEX IF NOT EXISTS idx_meetings_user_id ON meetings(user_id)")
+                cursor.execute("CREATE INDEX IF NOT EXISTS idx_meetings_created_at ON meetings(created_at)")
+                cursor.execute("CREATE INDEX IF NOT EXISTS idx_action_items_meeting_id ON action_items(meeting_id)")
+                cursor.execute("CREATE INDEX IF NOT EXISTS idx_summaries_meeting_id ON summaries(meeting_id)")
+                cursor.execute("CREATE INDEX IF NOT EXISTS idx_participants_meeting_id ON participants(meeting_id)")
+                cursor.execute("CREATE INDEX IF NOT EXISTS idx_integration_logs_lookup ON integration_logs(source, external_meeting_id, status)")
+
                 conn.commit()
                 logger.debug("Database initialized successfully.")
         except sqlite3.Error as e:
             logger.error(f"Error initializing database tables: {e}", exc_info=True)
             raise
+
+    # -------------------------------------------------------------------------
+    # Multi-User Authentication & Security Methods (Milestone 4 - Tasks 1 & 7)
+    # -------------------------------------------------------------------------
+    def register_user(
+        self,
+        username: str,
+        password: str,
+        email: Optional[str] = None,
+        full_name: Optional[str] = None
+    ) -> Dict[str, Any]:
+        """
+        Registers a new user with unique username, salted SHA-256 password hash,
+        and returns sanitized user profile without sensitive credentials.
+        """
+        if not username or not isinstance(username, str) or len(username.strip()) < 3:
+            raise ValueError("Username must be at least 3 characters long.")
+        if not password or not isinstance(password, str) or len(password) < 4:
+            raise ValueError("Password must be at least 4 characters long.")
+
+        clean_user = username.strip().lower()
+        clean_email = email.strip() if email else None
+        clean_name = full_name.strip() if full_name else clean_user.title()
+        now = datetime.now().isoformat()
+        pwd_hash, salt = hash_password(password)
+
+        try:
+            with self.get_connection() as conn:
+                cursor = conn.cursor()
+                cursor.execute("SELECT id FROM users WHERE username = ?", (clean_user,))
+                if cursor.fetchone():
+                    raise ValueError(f"Username '{clean_user}' is already registered.")
+
+                cursor.execute("""
+                    INSERT INTO users (username, password_hash, salt, email, full_name, created_at)
+                    VALUES (?, ?, ?, ?, ?, ?)
+                """, (clean_user, pwd_hash, salt, clean_email, clean_name, now))
+                conn.commit()
+                new_id = cursor.lastrowid
+                logger.info(f"User '{clean_user}' registered successfully (id={new_id}).")
+                return {
+                    "id": new_id,
+                    "username": clean_user,
+                    "email": clean_email,
+                    "full_name": clean_name,
+                    "created_at": now
+                }
+        except sqlite3.IntegrityError:
+            raise ValueError(f"Username '{clean_user}' is already registered.")
+
+    def authenticate_user(self, username: str, password: str) -> Optional[Dict[str, Any]]:
+        """
+        Authenticates a user against stored salted hash.
+        Returns user metadata dictionary if valid, or None if authentication fails.
+        """
+        if not username or not password:
+            return None
+
+        clean_user = username.strip().lower()
+        try:
+            with self.get_connection() as conn:
+                cursor = conn.cursor()
+                cursor.execute("SELECT * FROM users WHERE username = ?", (clean_user,))
+                user_row = cursor.fetchone()
+                if not user_row:
+                    return None
+
+                user_dict = dict(user_row)
+                if verify_password(password, user_dict["salt"], user_dict["password_hash"]):
+                    return {
+                        "id": user_dict["id"],
+                        "username": user_dict["username"],
+                        "email": user_dict.get("email"),
+                        "full_name": user_dict.get("full_name") or user_dict["username"].title(),
+                        "created_at": user_dict.get("created_at")
+                    }
+                return None
+        except sqlite3.Error as e:
+            logger.error(f"Error authenticating user '{clean_user}': {e}", exc_info=True)
+            return None
+
+    def get_user_by_id(self, user_id: int) -> Optional[Dict[str, Any]]:
+        try:
+            with self.get_connection() as conn:
+                cursor = conn.cursor()
+                cursor.execute("SELECT id, username, email, full_name, created_at FROM users WHERE id = ?", (user_id,))
+                row = cursor.fetchone()
+                return dict(row) if row else None
+        except sqlite3.Error:
+            return None
+
+    def get_user_by_username(self, username: str) -> Optional[Dict[str, Any]]:
+        try:
+            with self.get_connection() as conn:
+                cursor = conn.cursor()
+                cursor.execute("SELECT id, username, email, full_name, created_at FROM users WHERE username = ?", (username.strip().lower(),))
+                row = cursor.fetchone()
+                return dict(row) if row else None
+        except sqlite3.Error:
+            return None
 
     def save_meeting(
         self,
@@ -182,10 +365,11 @@ class DatabaseManager:
         transcript: str,
         intelligence: Dict[str, Any],
         participant_data: Dict[str, Any],
-        validation_info: Dict[str, Any]
+        validation_info: Dict[str, Any],
+        user_id: Optional[int] = 1
     ) -> str:
         """
-        Persists a complete processed meeting transactionally into SQLite.
+        Persists a complete processed meeting transactionally into SQLite with user ownership.
         Guarantees deduplicated participants, isolated links, and safe fallback handling.
         """
         if not meeting_id or not isinstance(meeting_id, str) or not meeting_id.strip():
@@ -208,8 +392,8 @@ class DatabaseManager:
                 cursor.execute("""
                     INSERT OR REPLACE INTO meetings (
                         meeting_id, title, audio_filename, file_size_mb, duration_seconds,
-                        format, language, transcript, word_count, validation_status, created_at
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        format, language, transcript, word_count, validation_status, created_at, user_id
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """, (
                     clean_meeting_id,
                     title or "Untitled Meeting",
@@ -221,7 +405,8 @@ class DatabaseManager:
                     transcript or "",
                     word_count,
                     "VALIDATED" if validation_info.get("is_valid", True) else "FAILED",
-                    now
+                    now,
+                    int(user_id or 1)
                 ))
 
                 # 2. Delete old related records if updating meeting
@@ -316,10 +501,10 @@ class DatabaseManager:
             logger.error(f"Database error while saving meeting '{clean_meeting_id}': {e}", exc_info=True)
             raise
 
-    def get_meeting(self, meeting_id: str) -> Optional[Dict[str, Any]]:
+    def get_meeting(self, meeting_id: str, user_id: Optional[int] = None) -> Optional[Dict[str, Any]]:
         """
         Retrieves complete meeting record including summary, action items, participants, and validation logs.
-        Strictly scopes by meeting_id to ensure complete data isolation.
+        Strictly scopes by meeting_id (and optional user_id) to ensure complete data isolation.
         Handles missing/unknown values safely and guards against malformed records.
         """
         if meeting_id is None or not isinstance(meeting_id, str) or not meeting_id.strip():
@@ -331,7 +516,10 @@ class DatabaseManager:
         try:
             with self.get_connection() as conn:
                 cursor = conn.cursor()
-                cursor.execute("SELECT * FROM meetings WHERE meeting_id = ?", (clean_id,))
+                if user_id is not None:
+                    cursor.execute("SELECT * FROM meetings WHERE meeting_id = ? AND (user_id = ? OR user_id IS NULL)", (clean_id, user_id))
+                else:
+                    cursor.execute("SELECT * FROM meetings WHERE meeting_id = ?", (clean_id,))
                 m_row = cursor.fetchone()
                 if not m_row:
                     logger.info(f"Meeting with ID '{clean_id}' not found in database.")
@@ -410,22 +598,28 @@ class DatabaseManager:
         meeting = self.get_meeting(meeting_id)
         return meeting.get("action_items") if meeting else None
 
-    def list_all_meetings(self, limit: Optional[int] = None, offset: Optional[int] = None) -> List[Dict[str, Any]]:
+    def list_all_meetings(self, limit: Optional[int] = None, offset: Optional[int] = None, user_id: Optional[int] = None) -> List[Dict[str, Any]]:
         """
         Lists summary metadata of all stored meetings ordered by creation time descending.
-        Supports optional pagination (limit and offset).
+        Supports optional pagination (limit and offset) and user-specific isolation.
         """
         try:
             with self.get_connection() as conn:
                 cursor = conn.cursor()
-                query = """
+                where_clause = ""
+                params = []
+                if user_id is not None:
+                    where_clause = "WHERE (m.user_id = ? OR m.user_id IS NULL)"
+                    params.append(user_id)
+
+                query = f"""
                     SELECT m.*, 
                            (SELECT summary_text FROM summaries s WHERE s.meeting_id = m.meeting_id) as summary,
                            (SELECT COUNT(*) FROM action_items a WHERE a.meeting_id = m.meeting_id) as action_count
                     FROM meetings m
+                    {where_clause}
                     ORDER BY created_at DESC
                 """
-                params = []
                 if limit is not None:
                     query += " LIMIT ?"
                     params.append(limit)
@@ -450,7 +644,8 @@ class DatabaseManager:
         format: Optional[str] = None,
         language: Optional[str] = None,
         limit: Optional[int] = None,
-        offset: Optional[int] = None
+        offset: Optional[int] = None,
+        user_id: Optional[int] = None
     ) -> List[Dict[str, Any]]:
         """
         Comprehensive case-insensitive historical meeting search and retrieval.
@@ -567,6 +762,10 @@ class DatabaseManager:
             clean_lang = str(language).strip()
             where_clauses.append("m.language LIKE ?")
             params.append(f"%{clean_lang}%")
+
+        if user_id is not None:
+            where_clauses.append("(m.user_id = ? OR m.user_id IS NULL)")
+            params.append(user_id)
 
         where_sql = " AND ".join(where_clauses)
         sql = f"""
@@ -789,24 +988,50 @@ class DatabaseManager:
             logger.error(f"Database error deleting meeting '{clean_id}': {e}", exc_info=True)
             raise
 
-    def get_dashboard_stats(self) -> Dict[str, Any]:
+    def get_dashboard_stats(self, user_id: Optional[int] = None) -> Dict[str, Any]:
         """
         Calculates aggregate repository statistics for dashboard and API display.
+        When user_id is provided, scopes calculations to that user's meetings.
         """
         try:
             with self.get_connection() as conn:
                 cursor = conn.cursor()
-                cursor.execute("SELECT COUNT(*) as total_meetings FROM meetings")
-                total_m = cursor.fetchone()["total_meetings"]
+                if user_id is not None:
+                    cursor.execute("SELECT COUNT(*) as total_meetings FROM meetings WHERE (user_id = ? OR user_id IS NULL)", (user_id,))
+                    total_m = cursor.fetchone()["total_meetings"]
 
-                cursor.execute("SELECT COUNT(*) as total_actions FROM action_items")
-                total_act = cursor.fetchone()["total_actions"]
+                    cursor.execute("""
+                        SELECT COUNT(*) as total_actions FROM action_items a
+                        JOIN meetings m ON a.meeting_id = m.meeting_id
+                        WHERE (m.user_id = ? OR m.user_id IS NULL)
+                    """, (user_id,))
+                    total_act = cursor.fetchone()["total_actions"]
 
-                cursor.execute("SELECT COUNT(*) as pending_actions FROM action_items WHERE status = 'Pending'")
-                pending_act = cursor.fetchone()["pending_actions"]
+                    cursor.execute("""
+                        SELECT COUNT(*) as pending_actions FROM action_items a
+                        JOIN meetings m ON a.meeting_id = m.meeting_id
+                        WHERE (m.user_id = ? OR m.user_id IS NULL) AND a.status = 'Pending'
+                    """, (user_id,))
+                    pending_act = cursor.fetchone()["pending_actions"]
 
-                cursor.execute("SELECT COUNT(*) as completed_actions FROM action_items WHERE status = 'Completed'")
-                completed_act = cursor.fetchone()["completed_actions"]
+                    cursor.execute("""
+                        SELECT COUNT(*) as completed_actions FROM action_items a
+                        JOIN meetings m ON a.meeting_id = m.meeting_id
+                        WHERE (m.user_id = ? OR m.user_id IS NULL) AND a.status = 'Completed'
+                    """, (user_id,))
+                    completed_act = cursor.fetchone()["completed_actions"]
+                else:
+                    cursor.execute("SELECT COUNT(*) as total_meetings FROM meetings")
+                    total_m = cursor.fetchone()["total_meetings"]
+
+                    cursor.execute("SELECT COUNT(*) as total_actions FROM action_items")
+                    total_act = cursor.fetchone()["total_actions"]
+
+                    cursor.execute("SELECT COUNT(*) as pending_actions FROM action_items WHERE status = 'Pending'")
+                    pending_act = cursor.fetchone()["pending_actions"]
+
+                    cursor.execute("SELECT COUNT(*) as completed_actions FROM action_items WHERE status = 'Completed'")
+                    completed_act = cursor.fetchone()["completed_actions"]
 
                 return {
                     "total_meetings": total_m,
@@ -825,12 +1050,14 @@ class DatabaseManager:
         end_date: Optional[str] = None,
         status: Optional[str] = None,
         title: Optional[str] = None,
-        limit: int = 50
+        limit: int = 50,
+        user_id: Optional[int] = None
     ) -> Dict[str, Any]:
         """
         Computes comprehensive cross-meeting historical insights, aggregate KPIs,
         filtered decisions, action items, participants directory, deadlines,
         and project history across the Meeting Knowledge Repository.
+        When user_id is provided, scopes the insights to that user's meetings.
         """
         try:
             with self.get_connection() as conn:
@@ -839,6 +1066,10 @@ class DatabaseManager:
                 # Base filtering for meetings
                 meeting_where = []
                 meeting_params = []
+
+                if user_id is not None:
+                    meeting_where.append("(m.user_id = ? OR m.user_id IS NULL)")
+                    meeting_params.append(user_id)
 
                 if title and title.strip():
                     meeting_where.append("m.title LIKE ?")
@@ -1083,6 +1314,99 @@ class DatabaseManager:
         except sqlite3.Error as e:
             logger.error(f"Database error getting historical insights: {e}", exc_info=True)
             raise
+
+    # -------------------------------------------------------------------------
+    # External Integrations Sync & Audit Logging (Milestone 4 - Tasks 4 & 5)
+    # -------------------------------------------------------------------------
+    def log_integration_event(
+        self,
+        source: str,
+        external_meeting_id: str,
+        internal_meeting_id: Optional[str],
+        title: Optional[str],
+        status: str,
+        details: Optional[str] = None,
+        user_id: int = 1
+    ) -> int:
+        """
+        Records an external sync event (Zoom / Google Meet) for auditing and duplicate prevention.
+        """
+        now = datetime.now().isoformat()
+        try:
+            with self.get_connection() as conn:
+                cursor = conn.cursor()
+                cursor.execute("""
+                    INSERT INTO integration_logs (
+                        source, external_meeting_id, internal_meeting_id, title, status, details, created_at, user_id
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                """, (
+                    source.lower().strip(),
+                    str(external_meeting_id).strip(),
+                    str(internal_meeting_id).strip() if internal_meeting_id else None,
+                    str(title).strip() if title else "Untitled Ingested Meeting",
+                    status.upper().strip(),
+                    str(details) if details else "",
+                    now,
+                    int(user_id or 1)
+                ))
+                conn.commit()
+                return cursor.lastrowid
+        except sqlite3.Error as e:
+            logger.error(f"Error logging integration event: {e}", exc_info=True)
+            return -1
+
+    def is_external_meeting_synced(
+        self,
+        source: str,
+        external_meeting_id: str,
+        user_id: Optional[int] = None
+    ) -> bool:
+        """
+        Checks whether an external meeting (Zoom/Google Meet) has already been successfully ingested.
+        Prevents redundant Whisper transcription and processing.
+        """
+        try:
+            with self.get_connection() as conn:
+                cursor = conn.cursor()
+                query = "SELECT COUNT(*) as count FROM integration_logs WHERE source = ? AND external_meeting_id = ? AND status = 'SUCCESS'"
+                params = [source.lower().strip(), str(external_meeting_id).strip()]
+                if user_id:
+                    query += " AND user_id = ?"
+                    params.append(int(user_id))
+                cursor.execute(query, params)
+                res = cursor.fetchone()
+                return bool(res and res["count"] > 0)
+        except sqlite3.Error as e:
+            logger.error(f"Error checking duplicate integration sync: {e}", exc_info=True)
+            return False
+
+    def get_integration_logs(
+        self,
+        source: Optional[str] = None,
+        user_id: Optional[int] = None,
+        limit: int = 50
+    ) -> List[Dict[str, Any]]:
+        """
+        Retrieves recent integration sync logs for auditing and UI display.
+        """
+        try:
+            with self.get_connection() as conn:
+                cursor = conn.cursor()
+                query = "SELECT * FROM integration_logs WHERE 1=1"
+                params = []
+                if source:
+                    query += " AND source = ?"
+                    params.append(source.lower().strip())
+                if user_id:
+                    query += " AND user_id = ?"
+                    params.append(int(user_id))
+                query += " ORDER BY id DESC LIMIT ?"
+                params.append(limit)
+                cursor.execute(query, params)
+                return [dict(row) for row in cursor.fetchall()]
+        except sqlite3.Error as e:
+            logger.error(f"Error retrieving integration logs: {e}", exc_info=True)
+            return []
 
 
 if __name__ == "__main__":

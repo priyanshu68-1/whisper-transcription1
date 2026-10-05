@@ -15,15 +15,21 @@ from validate_upload import validate_audio_file
 from llm_service import LLMService
 from participant_mapper import ParticipantMapper
 from action_engine import ActionItemEngine
+import importlib
+import database
+importlib.reload(database)
 from database import DatabaseManager
 from pipeline_service import ProcessingPipeline
 from ai_search_service import AISearchEngine
+from report_exporter import generate_meeting_pdf, generate_meeting_csv, generate_action_items_csv
+from zoom_integration import ZoomIntegrationService
+from google_meet_integration import GoogleMeetIntegrationService
 
 # -----------------------------------------------------------------------------
 # 1. PAGE CONFIGURATION
 # -----------------------------------------------------------------------------
 st.set_page_config(
-    page_title="TruthShield AI • Meeting Intelligence",
+    page_title="WhisperSense AI • Meeting Intelligence",
     page_icon="🎙️",
     layout="wide",
     initial_sidebar_state="expanded"
@@ -520,18 +526,98 @@ st.markdown(COLORFUL_CSS, unsafe_allow_html=True)
 # -----------------------------------------------------------------------------
 # 3. DATABASE SETUP & STATE MANAGEMENT
 # -----------------------------------------------------------------------------
-@st.cache_resource
-def get_db():
-    return DatabaseManager()
+db = DatabaseManager()
+ai_search = AISearchEngine(db=db)
 
-db = get_db()
+# -----------------------------------------------------------------------------
+# USER AUTHENTICATION & ACCESS CONTROL (Milestone 4 - Task 1 & Task 7)
+# -----------------------------------------------------------------------------
+if "authenticated_user" not in st.session_state or not st.session_state["authenticated_user"]:
+    st.markdown(COLORFUL_CSS, unsafe_allow_html=True)
+    
+    col_auth_left, col_auth_center, col_auth_right = st.columns([1, 2, 1])
+    with col_auth_center:
+        st.markdown(
+            """
+            <div style="text-align: center; margin-top: 30px; margin-bottom: 25px;">
+                <div style="background: linear-gradient(135deg, #4F46E5 0%, #7C3AED 50%, #EC4899 100%); width: 68px; height: 68px; border-radius: 18px; display: inline-flex; align-items: center; justify-content: center; font-size: 2.2rem; box-shadow: 0 8px 25px rgba(99, 102, 241, 0.45); margin-bottom: 12px;">
+                    🎙️
+                </div>
+                <h1 style="font-size: 2.2rem; font-weight: 800; margin: 0; background: linear-gradient(135deg, #4F46E5 0%, #EC4899 100%); -webkit-background-clip: text; -webkit-text-fill-color: transparent;">WhisperSense AI</h1>
+                <p style="color: #64748B; font-size: 0.95rem; font-weight: 500; margin-top: 6px;">Meeting Intelligence Platform & Knowledge Repository</p>
+                <div style="display: inline-block; background: #EEF2FF; border: 1px solid #C7D2FE; border-radius: 9999px; padding: 4px 14px; font-size: 0.78rem; font-weight: 700; color: #4338CA;">
+                    🔒 Secure Multi-User Access & Session Management
+                </div>
+            </div>
+            """,
+            unsafe_allow_html=True
+        )
 
-@st.cache_resource
-def get_ai_search():
-    return AISearchEngine(db=db)
+        auth_tab_login, auth_tab_reg = st.tabs(["🔐 Sign In", "📝 Create Account"])
 
-ai_search = get_ai_search()
-all_meetings = db.list_all_meetings()
+        with auth_tab_login:
+            st.markdown("<p style='font-size: 0.88rem; color: #475569; margin-top: 6px;'>Sign in to access your personal meeting recordings and intelligence repository.</p>", unsafe_allow_html=True)
+            with st.form("login_form"):
+                login_user = st.text_input("Username", placeholder="e.g. demo or your username").strip().lower()
+                login_pwd = st.text_input("Password", type="password", placeholder="Enter your password")
+                btn_login = st.form_submit_button("Sign In to WhisperSense AI", use_container_width=True)
+
+                if btn_login:
+                    if not login_user or not login_pwd:
+                        st.error("Please enter both username and password.")
+                    else:
+                        user_match = db.authenticate_user(login_user, login_pwd)
+                        if user_match:
+                            st.session_state["authenticated_user"] = user_match
+                            st.success(f"Welcome back, {user_match['full_name']}!")
+                            st.rerun()
+                        else:
+                            st.error("Invalid username or password.")
+
+            st.markdown("<div style='text-align: center; margin: 15px 0 10px 0; color: #94A3B8; font-size: 0.82rem;'>— OR FOR INSTANT ONE-CLICK EVALUATION —</div>", unsafe_allow_html=True)
+            if st.button("🚀 Quick Demo Sign In (demo / demo123)", use_container_width=True):
+                demo_user = db.authenticate_user("demo", "demo123")
+                if demo_user:
+                    st.session_state["authenticated_user"] = demo_user
+                    st.rerun()
+
+        with auth_tab_reg:
+            st.markdown("<p style='font-size: 0.88rem; color: #475569; margin-top: 6px;'>Register a new personal profile with isolated meeting storage.</p>", unsafe_allow_html=True)
+            with st.form("register_form"):
+                reg_name = st.text_input("Full Display Name", placeholder="e.g. Priyanshu Sharma")
+                reg_email = st.text_input("Email Address", placeholder="e.g. user@example.com")
+                reg_user = st.text_input("Choose Username (min 3 chars)", placeholder="e.g. priyanshu").strip().lower()
+                reg_pwd = st.text_input("Choose Password (min 4 chars)", type="password")
+                btn_register = st.form_submit_button("Create New Account", use_container_width=True)
+
+                if btn_register:
+                    if not reg_user or not reg_pwd:
+                        st.error("Username and password are required.")
+                    elif len(reg_user) < 3:
+                        st.error("Username must be at least 3 characters long.")
+                    elif len(reg_pwd) < 4:
+                        st.error("Password must be at least 4 characters long.")
+                    else:
+                        try:
+                            new_u = db.register_user(
+                                username=reg_user,
+                                password=reg_pwd,
+                                email=reg_email,
+                                full_name=reg_name
+                            )
+                            st.session_state["authenticated_user"] = new_u
+                            st.success(f"Account created successfully! Welcome, {new_u['full_name']}.")
+                            st.rerun()
+                        except ValueError as v_err:
+                            st.error(str(v_err))
+
+    st.stop()
+
+current_user = st.session_state.get("authenticated_user")
+if not current_user:
+    st.stop()
+
+all_meetings = db.list_all_meetings(user_id=current_user["id"])
 
 # Manage active meeting state cleanly
 if "active_meeting_id" not in st.session_state:
@@ -543,7 +629,7 @@ if "active_meeting_id" not in st.session_state:
 curr_mid = st.session_state.get("active_meeting_id")
 if curr_mid:
     if "active_meeting" not in st.session_state or not st.session_state.get("active_meeting") or st.session_state["active_meeting"].get("meeting_id") != curr_mid:
-        st.session_state["active_meeting"] = db.get_meeting(curr_mid)
+        st.session_state["active_meeting"] = db.get_meeting(curr_mid, user_id=current_user["id"])
 else:
     st.session_state["active_meeting"] = None
 
@@ -563,13 +649,31 @@ with st.sidebar:
                 🎙️
             </div>
             <div>
-                <h3 style="margin: 0; font-size: 1.25rem; font-weight: 800; color: #FFFFFF !important;">TruthShield AI</h3>
+                <h3 style="margin: 0; font-size: 1.25rem; font-weight: 800; color: #FFFFFF !important;">WhisperSense AI</h3>
                 <div style="font-size: 0.78rem; color: #A5B4FC !important; font-weight: 600;">Meeting Intelligence Suite</div>
             </div>
         </div>
         """,
         unsafe_allow_html=True
     )
+
+    # Active User Profile Badge & Logout (Task 1 & Task 7)
+    st.markdown(
+        f"""
+        <div style="background: rgba(255, 255, 255, 0.08); border: 1px solid rgba(255, 255, 255, 0.16); border-radius: 10px; padding: 10px 12px; margin-top: 6px; margin-bottom: 8px;">
+            <div style="font-size: 0.70rem; color: #A5B4FC !important; font-weight: 700; text-transform: uppercase; letter-spacing: 0.05em;">👤 Authenticated Profile</div>
+            <div style="font-size: 0.95rem; font-weight: 700; color: #FFFFFF !important; margin-top: 2px;">{current_user['full_name']}</div>
+            <div style="font-size: 0.76rem; color: rgba(255,255,255,0.7) !important;">@{current_user['username']} &bull; ID: #{current_user['id']}</div>
+        </div>
+        """,
+        unsafe_allow_html=True
+    )
+    if st.button("🚪 Sign Out", key="sb_sign_out_btn", use_container_width=True):
+        st.session_state["authenticated_user"] = None
+        st.session_state["active_meeting_id"] = None
+        st.session_state["active_meeting"] = None
+        st.rerun()
+
     st.divider()
 
     # Main Menu Navigation
@@ -591,7 +695,7 @@ with st.sidebar:
 
             if st.session_state.get("active_meeting_id") not in meeting_id_list:
                 st.session_state["active_meeting_id"] = meeting_id_list[0]
-                st.session_state["active_meeting"] = db.get_meeting(meeting_id_list[0])
+                st.session_state["active_meeting"] = db.get_meeting(meeting_id_list[0], user_id=current_user["id"])
 
             current_active = st.session_state.get("active_meeting_id")
             def_idx = meeting_id_list.index(current_active) if current_active in meeting_id_list else 0
@@ -606,7 +710,7 @@ with st.sidebar:
             )
             if chosen_id != current_active:
                 st.session_state["active_meeting_id"] = chosen_id
-                st.session_state["active_meeting"] = db.get_meeting(chosen_id)
+                st.session_state["active_meeting"] = db.get_meeting(chosen_id, user_id=current_user["id"])
                 st.rerun()
         else:
             st.caption("No saved meetings yet.")
@@ -646,7 +750,7 @@ with st.sidebar:
 
     # Repository KPI Summary
     st.markdown("<p style='font-size: 0.8rem; font-weight: 700; text-transform: uppercase; letter-spacing: 0.05em; color: #C7D2FE !important;'>📊 Meeting Library Stats</p>", unsafe_allow_html=True)
-    db_stats = db.get_dashboard_stats()
+    db_stats = db.get_dashboard_stats(user_id=current_user["id"])
     
     col_sb1, col_sb2 = st.columns(2)
     with col_sb1:
@@ -682,7 +786,7 @@ with st.sidebar:
     st.markdown(
         """
         <div style="font-size: 0.74rem; color: rgba(255,255,255,0.6) !important; text-align: center;">
-            TruthShield AI &bull; Vibrant Edition 2026<br>
+            WhisperSense AI &bull; Vibrant Edition 2026<br>
             Powered by Whisper & Gemini
         </div>
         """,
@@ -792,7 +896,8 @@ def render_historical_insights(is_tab: bool = False):
             start_date=start_date_val,
             status=selected_status,
             title=selected_title,
-            limit=50
+            limit=50,
+            user_id=current_user["id"]
         )
 
     # 4. Check for Empty Data State
@@ -1063,15 +1168,16 @@ if app_section == "🎙️ Meeting Notes":
                             st.toast("Sample Meeting loaded!", icon="🎉")
                             st.rerun()
 
-    # 7 Clean Tabs (Accuracy is in its own separate page!)
-    tab_upload, tab_summary, tab_people, tab_transcript, tab_saved, tab_ai, tab_insights = st.tabs([
+    # 8 Clean Tabs (Accuracy is in its own separate page!)
+    tab_upload, tab_summary, tab_people, tab_transcript, tab_saved, tab_ai, tab_insights, tab_integrations = st.tabs([
         "🎙️ Upload Audio",
         "📋 Summary & Tasks",
         "👥 People",
         "📝 Transcript",
         "📁 Saved Meetings",
         "🤖 Ask AI",
-        "📊 Historical Insights"
+        "📊 Historical Insights",
+        "⚡ Integrations"
     ])
 
     # -------------------------------------------------------------------------
@@ -1147,7 +1253,8 @@ if app_section == "🎙️ Meeting Notes":
                                 ok, data, pmsg = pipeline.run_full_pipeline(
                                     work_path,
                                     meeting_title=final_title,
-                                    custom_meeting_id=new_id
+                                    custom_meeting_id=new_id,
+                                    user_id=current_user["id"]
                                 )
 
                                 st.write("3️⃣ Extracting key discussion points & decisions...")
@@ -1222,6 +1329,51 @@ if app_section == "🎙️ Meeting Notes":
                 """,
                 unsafe_allow_html=True
             )
+
+            # Milestone 4 - Task 6: Export Intelligence Dossier & Reports
+            with st.container(border=True):
+                col_exp_info, col_exp_pdf, col_exp_csv, col_exp_act = st.columns([1.8, 1, 1, 1.2])
+                with col_exp_info:
+                    st.markdown("<div style='font-weight: 700; color: #1E1B4B; font-size: 0.95rem;'>📥 Export Reports & Dossier</div><div style='font-size: 0.78rem; color: #64748B;'>Download executive PDF summary or structured CSV spreadsheets</div>", unsafe_allow_html=True)
+                with col_exp_pdf:
+                    try:
+                        pdf_data = generate_meeting_pdf(active_m)
+                        st.download_button(
+                            label="📄 PDF Dossier",
+                            data=pdf_data,
+                            file_name=f"{active_m.get('meeting_id', 'meeting')}_dossier.pdf",
+                            mime="application/pdf",
+                            key=f"dl_pdf_{active_m.get('meeting_id')}",
+                            use_container_width=True
+                        )
+                    except Exception as pe:
+                        st.caption(f"PDF unavailable: {pe}")
+                with col_exp_csv:
+                    try:
+                        csv_full = generate_meeting_csv(active_m)
+                        st.download_button(
+                            label="📊 Full CSV",
+                            data=csv_full,
+                            file_name=f"{active_m.get('meeting_id', 'meeting')}_report.csv",
+                            mime="text/csv",
+                            key=f"dl_csv_{active_m.get('meeting_id')}",
+                            use_container_width=True
+                        )
+                    except Exception as ce:
+                        st.caption(f"CSV unavailable: {ce}")
+                with col_exp_act:
+                    try:
+                        csv_acts = generate_action_items_csv(active_m)
+                        st.download_button(
+                            label="📋 Tasks CSV",
+                            data=csv_acts,
+                            file_name=f"{active_m.get('meeting_id', 'meeting')}_action_items.csv",
+                            mime="text/csv",
+                            key=f"dl_act_csv_{active_m.get('meeting_id')}",
+                            use_container_width=True
+                        )
+                    except Exception as ae:
+                        st.caption(f"Tasks CSV unavailable: {ae}")
 
             col_sum1, col_sum2 = st.columns(2)
             with col_sum1:
@@ -1477,16 +1629,17 @@ if app_section == "🎙️ Meeting Notes":
                 query=search_term_db.strip(),
                 participant=filter_participant.strip(),
                 date=filter_date.strip(),
-                title=filter_title.strip()
+                title=filter_title.strip(),
+                user_id=current_user["id"]
             )
             st.markdown(f"<p style='font-size: 0.85rem; color: #4F46E5; font-weight: 600; margin: 4px 0 12px 0;'>🔍 Found {len(saved_list)} meeting(s) matching your criteria</p>", unsafe_allow_html=True)
         else:
-            saved_list = db.list_all_meetings()
+            saved_list = db.list_all_meetings(user_id=current_user["id"])
 
         if saved_list:
             for m in saved_list:
                 mid = m["meeting_id"]
-                is_active_session = (active_m and active_m.get("meeting_id") == mid)
+                is_active_session = bool(active_m and active_m.get("meeting_id") == mid)
 
                 with st.container(border=True):
                     col_head1, col_head2 = st.columns([3, 1.2])
@@ -1510,7 +1663,7 @@ if app_section == "🎙️ Meeting Notes":
                     with col_btn1:
                         if st.button("📂 Open Meeting", key=f"open_{mid}"):
                             st.session_state["active_meeting_id"] = mid
-                            st.session_state["active_meeting"] = db.get_meeting(mid)
+                            st.session_state["active_meeting"] = db.get_meeting(mid, user_id=current_user["id"])
                             st.toast(f"Opened '{m['title']}'!", icon="📂")
                             st.rerun()
                     with col_btn2:
@@ -1518,21 +1671,63 @@ if app_section == "🎙️ Meeting Notes":
                             db.delete_meeting(mid)
                             st.toast("Meeting removed.", icon="🗑️")
                             if st.session_state.get("active_meeting_id") == mid:
-                                rem = db.list_all_meetings()
+                                rem = db.list_all_meetings(user_id=current_user["id"])
                                 if rem:
                                     st.session_state["active_meeting_id"] = rem[0]["meeting_id"]
-                                    st.session_state["active_meeting"] = db.get_meeting(rem[0]["meeting_id"])
+                                    st.session_state["active_meeting"] = db.get_meeting(rem[0]["meeting_id"], user_id=current_user["id"])
                                 else:
                                     st.session_state["active_meeting_id"] = None
                                     st.session_state["active_meeting"] = None
                             st.rerun()
 
                     # Expandable Meeting History & Full Record
-                    with st.expander("📖 View Meeting Intelligence & Full Notes", expanded=is_active_session):
-                        detail_m = db.get_meeting(mid)
+                    with st.expander("📖 View Meeting Intelligence & Full Notes", expanded=bool(is_active_session)):
+                        detail_m = db.get_meeting(mid, user_id=current_user["id"])
                         if detail_m:
                             if is_active_session:
                                 st.success("✅ **Currently Active Meeting:** Loaded into **Summary & Tasks**, **People**, and **Transcript** tabs at the top.")
+
+                            # Milestone 4 - Task 6: Export Actions
+                            c_ex1, c_ex2, c_ex3 = st.columns(3)
+                            with c_ex1:
+                                try:
+                                    pdf_data = generate_meeting_pdf(detail_m)
+                                    st.download_button(
+                                        label="📄 PDF Dossier",
+                                        data=pdf_data,
+                                        file_name=f"{mid}_dossier.pdf",
+                                        mime="application/pdf",
+                                        key=f"dl_pdf_tab5_{mid}",
+                                        use_container_width=True
+                                    )
+                                except Exception as pe:
+                                    st.caption(f"PDF error: {pe}")
+                            with c_ex2:
+                                try:
+                                    csv_data = generate_meeting_csv(detail_m)
+                                    st.download_button(
+                                        label="📊 Intelligence CSV",
+                                        data=csv_data,
+                                        file_name=f"{mid}_report.csv",
+                                        mime="text/csv",
+                                        key=f"dl_csv_tab5_{mid}",
+                                        use_container_width=True
+                                    )
+                                except Exception as ce:
+                                    st.caption(f"CSV error: {ce}")
+                            with c_ex3:
+                                try:
+                                    act_csv_data = generate_action_items_csv(detail_m)
+                                    st.download_button(
+                                        label="📋 Tasks CSV",
+                                        data=act_csv_data,
+                                        file_name=f"{mid}_action_items.csv",
+                                        mime="text/csv",
+                                        key=f"dl_act_csv_tab5_{mid}",
+                                        use_container_width=True
+                                    )
+                                except Exception as ae:
+                                    st.caption(f"Tasks error: {ae}")
 
                             st.markdown("**Executive Summary:**")
                             st.info(detail_m.get("summary") or "No summary available.")
@@ -1623,7 +1818,7 @@ if app_section == "🎙️ Meeting Notes":
                     <div>
                         <h3 style="margin: 0; color: #FFFFFF !important; font-size: 1.35rem; font-weight: 800;">Contextual AI Meeting Search & Q&A</h3>
                         <p style="margin: 3px 0 0 0; font-size: 0.88rem; color: #C7D2FE !important;">
-                            Ask questions in natural language across all historical meeting records. TruthShield AI synthesizes answers grounded strictly in your saved meetings, citing exact source meeting IDs with zero hallucination.
+                            Ask questions in natural language across all historical meeting records. WhisperSense AI synthesizes answers grounded strictly in your saved meetings, citing exact source meeting IDs with zero hallucination.
                         </p>
                     </div>
                 </div>
@@ -1751,7 +1946,7 @@ if app_section == "🎙️ Meeting Notes":
                         with sm_col2:
                             if st.button("📂 Open Meeting", key=f"ai_open_{sm_id}", use_container_width=True):
                                 st.session_state["active_meeting_id"] = sm_id
-                                st.session_state["active_meeting"] = db.get_meeting(sm_id)
+                                st.session_state["active_meeting"] = db.get_meeting(sm_id, user_id=current_user["id"])
                                 st.toast(f"Switched active meeting to {sm_title}!", icon="📂")
                                 st.rerun()
 
@@ -1783,6 +1978,272 @@ if app_section == "🎙️ Meeting Notes":
     # -------------------------------------------------------------------------
     with tab_insights:
         render_historical_insights(is_tab=True)
+
+    # -------------------------------------------------------------------------
+    # TAB 8: EXTERNAL INTEGRATIONS (Milestone 4 - Task 4: Zoom)
+    # -------------------------------------------------------------------------
+    with tab_integrations:
+        st.markdown(
+            """
+            <div style="background: linear-gradient(135deg, #0284C7 0%, #2563EB 50%, #4F46E5 100%); border-radius: 14px; padding: 22px 26px; margin-bottom: 20px; color: #FFFFFF !important; box-shadow: 0 4px 16px rgba(37, 99, 235, 0.18);">
+                <div style="display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 10px;">
+                    <div style="display: flex; align-items: center; gap: 12px;">
+                        <span style="font-size: 2rem;">⚡</span>
+                        <div>
+                            <h3 style="margin: 0; color: #FFFFFF !important; font-size: 1.35rem; font-weight: 800;">External Meeting Integrations</h3>
+                            <p style="margin: 3px 0 0 0; font-size: 0.88rem; color: #E0E7FF !important;">
+                                Seamlessly connect Zoom Cloud Recordings and external video meeting platforms directly to the WhisperSense AI processing pipeline.
+                            </p>
+                        </div>
+                    </div>
+                    <span class="badge-vibrant badge-emerald" style="font-size: 0.88rem; padding: 6px 14px;">🟢 Ingestion Engine Ready</span>
+                </div>
+            </div>
+            """,
+            unsafe_allow_html=True
+        )
+
+        sub_tab_zoom, sub_tab_meet = st.tabs(["🎥 Zoom Cloud Integration", "📹 Google Meet (Task 5)"])
+
+        with sub_tab_zoom:
+            col_z_left, col_z_right = st.columns([3, 2])
+
+            with col_z_left:
+                with st.container(border=True):
+                    st.markdown("<h4 style='margin-top:0; color:#1E1B4B;'>📥 Ingest Zoom Cloud Recording</h4>", unsafe_allow_html=True)
+                    st.caption("Enter a Zoom meeting ID or upload a Zoom local/cloud recording to trigger automated transcription, LLM summary, and action items.")
+
+                    zoom_mid_input = st.text_input("Zoom Meeting ID or UUID*", placeholder="e.g. 984-2109-4810 or ZOOM-UUID-9128", key="zoom_mid_inp")
+                    zoom_topic_input = st.text_input("Meeting Topic / Title", placeholder="e.g. Q3 Sprint Architecture Review", key="zoom_topic_inp")
+
+                    audio_source_type = st.radio(
+                        "Audio Recording Source:",
+                        ["⚡ Built-in Test Recording (Instant Demo)", "📁 Upload Zoom Recording File (.m4a, .mp3, .wav)"],
+                        horizontal=True
+                    )
+
+                    uploaded_zoom_file = None
+                    if "Upload" in audio_source_type:
+                        uploaded_zoom_file = st.file_uploader(
+                            "Select Zoom Audio Recording",
+                            type=["m4a", "mp3", "wav"],
+                            key="zoom_uploader_file"
+                        )
+
+                    is_dup = False
+                    if zoom_mid_input.strip():
+                        is_dup = db.is_external_meeting_synced("zoom", zoom_mid_input.strip(), user_id=current_user["id"])
+                        if is_dup:
+                            st.warning(f"⚠️ Meeting ID `{zoom_mid_input.strip()}` was already synced. Syncing again will skip duplicate transcription.")
+
+                    btn_sync_zoom = st.button("🚀 Ingest & Process Zoom Recording", type="primary", use_container_width=True)
+
+                    if btn_sync_zoom:
+                        clean_z_id = zoom_mid_input.strip()
+                        if not clean_z_id:
+                            st.error("Please enter a Zoom Meeting ID.")
+                        elif is_dup:
+                            st.info(f"Meeting `{clean_z_id}` is already in the repository. View it in the **📁 Saved Meetings** tab.")
+                        else:
+                            audio_work_file = None
+                            if "Upload" in audio_source_type:
+                                if not uploaded_zoom_file:
+                                    st.error("Please select a Zoom recording file to upload.")
+                                else:
+                                    with tempfile.NamedTemporaryFile(delete=False, suffix=os.path.splitext(uploaded_zoom_file.name)[1]) as tf:
+                                        tf.write(uploaded_zoom_file.read())
+                                        audio_work_file = tf.name
+                            else:
+                                if os.path.exists("transcipt_test2.mp3"):
+                                    audio_work_file = "transcipt_test2.mp3"
+                                else:
+                                    st.error("Sample audio recording not found.")
+
+                            if audio_work_file:
+                                with st.status("⚡ Syncing Zoom meeting through WhisperSense AI pipeline...", expanded=True) as s_box:
+                                    st.write("1️⃣ Ingesting Zoom recording audio...")
+                                    st.write("2️⃣ Executing Whisper Speech-to-Text transcription...")
+                                    st.write("3️⃣ Extracting strategic intelligence, tasks, and participants...")
+
+                                    zoom_srv = ZoomIntegrationService(db=db)
+                                    final_topic = zoom_topic_input.strip() or f"Zoom Meeting {clean_z_id}"
+                                    ok, p_res, p_msg = zoom_srv.sync_manual_meeting(
+                                        zoom_meeting_id=clean_z_id,
+                                        topic=final_topic,
+                                        audio_file_path=audio_work_file,
+                                        user_id=current_user["id"]
+                                    )
+
+                                    if ok:
+                                        st.session_state["active_meeting_id"] = p_res["meeting_id"]
+                                        st.session_state["active_meeting"] = p_res
+                                        s_box.update(label="✅ Zoom Recording Processed Successfully!", state="complete")
+                                        st.success(f"🎉 Zoom meeting `{p_res['meeting_id']}` saved with {len(p_res.get('action_items', []))} action items!")
+                                        st.toast("Zoom Meeting Ingested!", icon="🎥")
+                                        st.rerun()
+                                    else:
+                                        s_box.update(label="❌ Zoom Sync Failed", state="error")
+                                        st.error(f"Error processing Zoom recording: {p_msg}")
+
+            with col_z_right:
+                with st.container(border=True):
+                    st.markdown("<h4 style='margin-top:0; color:#1E1B4B;'>⚙️ Zoom Webhook Configuration</h4>", unsafe_allow_html=True)
+                    st.markdown(
+                        """
+                        Configure Zoom Cloud Recording webhooks in your Zoom App Marketplace:
+                        - **Event Name:** `recording.completed`
+                        - **Webhook Endpoint:**
+                        ```text
+                        POST http://localhost:8000/integrations/zoom/webhook
+                        ```
+                        - **Verification:** HMAC SHA-256 (`x-zm-signature`)
+                        - **Challenge:** Automatic `endpoint.url_validation`
+                        """
+                    )
+                    st.info("💡 **Autonomous Ingestion:** When Zoom finishes processing a cloud recording, the webhook automatically triggers Whisper transcription and persists intelligence.")
+
+            # Zoom Sync Audit Logs Table
+            st.markdown("<h4 style='margin-top: 18px; color: #1E1B4B;'>📋 Zoom Integration Audit Log</h4>", unsafe_allow_html=True)
+            zoom_logs = db.get_integration_logs(source="zoom", user_id=current_user["id"], limit=15)
+            if zoom_logs:
+                for zl in zoom_logs:
+                    with st.container(border=True):
+                        c_zl1, c_zl2, c_zl3 = st.columns([3, 1.5, 1])
+                        with c_zl1:
+                            st.markdown(f"**{zl.get('title', 'Zoom Meeting')}** &bull; External ID: `{zl.get('external_meeting_id')}`")
+                            st.caption(f"Details: {zl.get('details')} | Date: {zl.get('created_at', '')[:19]}")
+                        with c_zl2:
+                            st_val = zl.get("status", "SUCCESS")
+                            badge_cls = "badge-emerald" if st_val == "SUCCESS" else ("badge-amber" if st_val == "DUPLICATE" else "badge-rose")
+                            st.markdown(f"<span class='badge-vibrant {badge_cls}'>{st_val}</span>", unsafe_allow_html=True)
+                        with c_zl3:
+                            int_id = zl.get("internal_meeting_id")
+                            if int_id and st.button("📂 Open", key=f"open_zl_{zl['id']}"):
+                                st.session_state["active_meeting_id"] = int_id
+                                st.session_state["active_meeting"] = db.get_meeting(int_id, user_id=current_user["id"])
+                                st.toast(f"Opened Zoom Meeting {int_id}", icon="📂")
+                                st.rerun()
+            else:
+                st.caption("No Zoom meetings synced yet. Ingest a meeting above to populate the audit log.")
+
+        with sub_tab_meet:
+            col_m_left, col_m_right = st.columns([3, 2])
+
+            with col_m_left:
+                with st.container(border=True):
+                    st.markdown("<h4 style='margin-top:0; color:#1E1B4B;'>📹 Ingest Google Meet Recording</h4>", unsafe_allow_html=True)
+                    st.caption("Enter a Google Meet meeting URL / code or upload a Google Drive meeting recording to run automated transcription, LLM summary, and action items.")
+
+                    meet_code_input = st.text_input("Google Meet URL or Code*", placeholder="e.g. https://meet.google.com/abc-defg-hij or abc-defg-hij", key="meet_code_inp")
+                    meet_topic_input = st.text_input("Meeting Topic / Title", placeholder="e.g. Weekly Product Design Sync", key="meet_topic_inp")
+
+                    meet_audio_choice = st.radio(
+                        "Recording File Source:",
+                        ["⚡ Built-in Test Recording (Instant Demo)", "📁 Upload Meet Recording (.mp4, .m4a, .mp3, .wav)"],
+                        horizontal=True,
+                        key="meet_audio_radio"
+                    )
+
+                    uploaded_meet_file = None
+                    if "Upload" in meet_audio_choice:
+                        uploaded_meet_file = st.file_uploader(
+                            "Select Google Meet Audio / Video Recording",
+                            type=["mp4", "m4a", "mp3", "wav"],
+                            key="meet_uploader_file"
+                        )
+
+                    meet_srv = GoogleMeetIntegrationService(db=db)
+                    canonical_code = meet_srv.parse_meet_code(meet_code_input.strip())
+                    is_meet_dup = False
+                    if canonical_code:
+                        is_meet_dup = meet_srv.is_duplicate(canonical_code, user_id=current_user["id"])
+                        if is_meet_dup:
+                            st.warning(f"⚠️ Google Meet `{canonical_code}` was already synced. Syncing again will skip duplicate transcription.")
+
+                    btn_sync_meet = st.button("🚀 Ingest & Process Google Meet Recording", type="primary", use_container_width=True, key="btn_sync_meet")
+
+                    if btn_sync_meet:
+                        if not canonical_code:
+                            st.error("Please enter a valid Google Meet URL or code (format: abc-defg-hij).")
+                        elif is_meet_dup:
+                            st.info(f"Google Meet `{canonical_code}` is already in the repository. View it in the **📁 Saved Meetings** tab.")
+                        else:
+                            audio_meet_work = None
+                            if "Upload" in meet_audio_choice:
+                                if not uploaded_meet_file:
+                                    st.error("Please select a recording file to upload.")
+                                else:
+                                    with tempfile.NamedTemporaryFile(delete=False, suffix=os.path.splitext(uploaded_meet_file.name)[1]) as tf:
+                                        tf.write(uploaded_meet_file.read())
+                                        audio_meet_work = tf.name
+                            else:
+                                if os.path.exists("transcipt_test2.mp3"):
+                                    audio_meet_work = "transcipt_test2.mp3"
+                                else:
+                                    st.error("Sample audio recording not found.")
+
+                            if audio_meet_work:
+                                with st.status("⚡ Syncing Google Meet recording through WhisperSense AI pipeline...", expanded=True) as m_box:
+                                    st.write("1️⃣ Ingesting Google Meet recording audio/video...")
+                                    st.write("2️⃣ Executing Whisper Speech-to-Text transcription...")
+                                    st.write("3️⃣ Extracting strategic intelligence, tasks, and participants...")
+
+                                    final_m_topic = meet_topic_input.strip() or f"Google Meet {canonical_code}"
+                                    m_ok, m_res, m_msg = meet_srv.process_meet_recording(
+                                        meet_code_or_url=canonical_code,
+                                        topic=final_m_topic,
+                                        audio_file_path=audio_meet_work,
+                                        user_id=current_user["id"]
+                                    )
+
+                                    if m_ok:
+                                        st.session_state["active_meeting_id"] = m_res["meeting_id"]
+                                        st.session_state["active_meeting"] = m_res
+                                        m_box.update(label="✅ Google Meet Processed Successfully!", state="complete")
+                                        st.success(f"🎉 Google Meet `{m_res['meeting_id']}` saved with {len(m_res.get('action_items', []))} action items!")
+                                        st.toast("Google Meet Ingested!", icon="📹")
+                                        st.rerun()
+                                    else:
+                                        m_box.update(label="❌ Google Meet Sync Failed", state="error")
+                                        st.error(f"Error processing Google Meet recording: {m_msg}")
+
+            with col_m_right:
+                with st.container(border=True):
+                    st.markdown("<h4 style='margin-top:0; color:#1E1B4B;'>📁 Google Drive & Meet Sync</h4>", unsafe_allow_html=True)
+                    st.markdown(
+                        """
+                        Google Meet automatically deposits cloud recordings into **Google Drive** in the `Meet Recordings` folder.
+                        - **Supported Formats:** `.mp4`, `.m4a`, `.mp3`, `.wav`
+                        - **Meeting Codes:** Format like `abc-defg-hij` (automatically parsed from Meet URLs).
+                        - **Data Segregation:** Stored securely under your authenticated account.
+                        """
+                    )
+                    st.info("💡 **Enterprise Ingestion:** Ingest any exported Google Meet recording to immediately extract decisions, responsibilities, and generate PDF executive dossiers.")
+
+            # Google Meet Sync Audit Logs Table
+            st.markdown("<h4 style='margin-top: 18px; color: #1E1B4B;'>📋 Google Meet Integration Audit Log</h4>", unsafe_allow_html=True)
+            meet_logs = db.get_integration_logs(source="google_meet", user_id=current_user["id"], limit=15)
+            if meet_logs:
+                for ml in meet_logs:
+                    with st.container(border=True):
+                        c_ml1, c_ml2, c_ml3 = st.columns([3, 1.5, 1])
+                        with c_ml1:
+                            st.markdown(f"**{ml.get('title', 'Google Meet')}** &bull; Meet Code: `{ml.get('external_meeting_id')}`")
+                            st.caption(f"Details: {ml.get('details')} | Date: {ml.get('created_at', '')[:19]}")
+                        with c_ml2:
+                            st_val = ml.get("status", "SUCCESS")
+                            badge_cls = "badge-emerald" if st_val == "SUCCESS" else ("badge-amber" if st_val == "DUPLICATE" else "badge-rose")
+                            st.markdown(f"<span class='badge-vibrant {badge_cls}'>{st_val}</span>", unsafe_allow_html=True)
+                        with c_ml3:
+                            int_id = ml.get("internal_meeting_id")
+                            if int_id and st.button("📂 Open", key=f"open_ml_{ml['id']}"):
+                                st.session_state["active_meeting_id"] = int_id
+                                st.session_state["active_meeting"] = db.get_meeting(int_id, user_id=current_user["id"])
+                                st.toast(f"Opened Google Meet {int_id}", icon="📂")
+                                st.rerun()
+            else:
+                st.caption("No Google Meet sessions synced yet. Ingest a meeting above to populate the audit log.")
+
 
 
 # -----------------------------------------------------------------------------
@@ -1843,7 +2304,7 @@ elif app_section == "🎯 Accuracy Checker":
                         options=[m["meeting_id"] for m in all_meetings],
                         format_func=lambda x: f"{next((m['title'] for m in all_meetings if m['meeting_id'] == x), x)} ({x})"
                     )
-                    meeting_data = db.get_meeting(chosen_m_id)
+                    meeting_data = db.get_meeting(chosen_m_id, user_id=current_user["id"])
                     if meeting_data:
                         preset_hypothesis = meeting_data.get("transcript", "")
                         st.caption(f"Loaded meeting with {len(preset_hypothesis.split())} words.")

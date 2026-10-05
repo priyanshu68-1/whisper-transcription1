@@ -24,7 +24,7 @@ if not logger.handlers:
 logger.setLevel(logging.INFO)
 
 AI_SEARCH_SYSTEM_INSTRUCTION = """
-You are TruthShield AI's Contextual Meeting Intelligence Assistant.
+You are WhisperSense AI's Contextual Meeting Intelligence Assistant.
 Your task is to answer user questions strictly and ONLY using the provided historical meeting context.
 
 CRITICAL RULES:

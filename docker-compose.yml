@@ -1,0 +1,58 @@
+services:
+  # ---------------------------------------------------------------------------
+  # WhisperSense AI Backend REST API (FastAPI)
+  # ---------------------------------------------------------------------------
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: whispersense_api
+    restart: unless-stopped
+    command: python -m uvicorn api:app --host 0.0.0.0 --port 8000
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./whisper_meetings.db:/app/whisper_meetings.db
+      - ./exports:/app/exports
+    environment:
+      - PYTHONUNBUFFERED=1
+      - API_AUTH_TOKEN=${API_AUTH_TOKEN:-whispersense-secret-key-2024}
+      - GEMINI_API_KEY=${GEMINI_API_KEY:-}
+      - ZOOM_WEBHOOK_SECRET_TOKEN=${ZOOM_WEBHOOK_SECRET_TOKEN:-sample_secret_token_12345}
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/docs"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 20s
+
+  # ---------------------------------------------------------------------------
+  # WhisperSense AI Web Intelligence Studio (Streamlit)
+  # ---------------------------------------------------------------------------
+  dashboard:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: whispersense_dashboard
+    restart: unless-stopped
+    command: streamlit run app.py --server.port=8501 --server.address=0.0.0.0 --server.headless=true
+    ports:
+      - "8501:8501"
+    volumes:
+      - ./whisper_meetings.db:/app/whisper_meetings.db
+      - ./exports:/app/exports
+    environment:
+      - PYTHONUNBUFFERED=1
+      - API_URL=http://api:8000
+      - GEMINI_API_KEY=${GEMINI_API_KEY:-}
+    depends_on:
+      - api
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8501/_stcore/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
+
+volumes:
+  exports:

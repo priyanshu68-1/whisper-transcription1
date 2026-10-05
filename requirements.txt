@@ -8,3 +8,4 @@ jiwer
 fastapi
 uvicorn
 httpx
+reportlab
